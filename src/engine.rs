@@ -320,6 +320,61 @@ impl HypergraphSQLEngine {
             self.materialized_views.insert(format!("__CTE_{}", cte_name), cte_batches.clone());
         }
         
+        // 3.7. Store table aliases in node metadata for better schema resolution
+        // This allows operators to resolve columns using stored alias mappings
+        if !parsed.table_aliases.is_empty() {
+            for (alias, table_name) in &parsed.table_aliases {
+                if let Some(table_node) = self.graph.get_table_node(table_name) {
+                    let table_node_id = table_node.id;
+                    
+                    // Get existing aliases or create new map
+                    let existing_aliases_json = table_node.metadata.get("table_aliases")
+                        .and_then(|s| serde_json::from_str::<HashMap<String, String>>(s).ok())
+                        .unwrap_or_default();
+                    
+                    // Add new alias to existing ones
+                    let mut updated_aliases = existing_aliases_json;
+                    updated_aliases.insert(alias.clone(), table_name.clone());
+                    
+                    // Store reverse mapping: table -> list of aliases (for querying which aliases exist)
+                    let reverse_aliases_json = table_node.metadata.get("alias_names")
+                        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                        .unwrap_or_default();
+                    
+                    let mut updated_reverse_aliases = reverse_aliases_json;
+                    if !updated_reverse_aliases.contains(alias) {
+                        updated_reverse_aliases.push(alias.clone());
+                    }
+                    
+                    // Update node metadata with alias information
+                    let mut metadata_updates = HashMap::new();
+                    metadata_updates.insert("table_aliases".to_string(), serde_json::to_string(&updated_aliases)?);
+                    metadata_updates.insert("alias_names".to_string(), serde_json::to_string(&updated_reverse_aliases)?);
+                    metadata_updates.insert("last_alias_update".to_string(), format!("{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs()));
+                    
+                    self.graph.update_node_metadata(table_node_id, metadata_updates);
+                }
+            }
+        }
+        
+        // 3.8. Track access patterns for tables accessed in this query (Phase 1: Access patterns)
+        for table_name in &parsed.tables {
+            if let Err(e) = self.track_access_pattern(table_name, None) {
+                // Log warning but don't fail query
+                eprintln!("Warning: Failed to track access pattern for table '{}': {}", table_name, e);
+            }
+        }
+        
+        // Track accessed columns from SELECT clause
+        for col in &parsed.columns {
+            // Extract table name from qualified column (e.g., "table.column")
+            if let Some((table, column)) = col.split_once('.') {
+                if let Err(e) = self.track_access_pattern(table, Some(column)) {
+                    eprintln!("Warning: Failed to track access pattern for column '{}': {}", col, e);
+                }
+            }
+        }
+        
         // 4. Plan query with CTE context
         let planner = if let Some(cte_ctx) = &cte_context {
             self.planner.clone().with_cte_context(cte_ctx.clone())
@@ -371,6 +426,50 @@ impl HypergraphSQLEngine {
         } else {
             self.execution_engine.execute(&plan)?
         };
+        
+        // 6.5. Track join statistics if JOINs were executed (Phase 2: Join statistics)
+        // Parse query again to get join information (parsed is only in scope inside plan cache block)
+        if let Ok(ast_for_join) = parse_sql(sql) {
+            if let Ok(parsed_for_join) = extract_query_info_enhanced(&ast_for_join) {
+                if !parsed_for_join.joins.is_empty() && parsed_for_join.tables.len() >= 2 {
+                    // Calculate join statistics for each join
+                    for (join_idx, _join) in parsed_for_join.joins.iter().enumerate() {
+                        // Get table names - first table is left, get right from tables list or join info
+                        let left_table = &parsed_for_join.tables[0];
+                        let right_table = if parsed_for_join.tables.len() > join_idx + 1 {
+                            &parsed_for_join.tables[join_idx + 1]
+                        } else if parsed_for_join.tables.len() > 1 {
+                            &parsed_for_join.tables[1]
+                        } else {
+                            continue;
+                        };
+                        
+                        // Calculate approximate selectivity and cardinality
+                        let left_rows = self.graph.get_table_node(left_table)
+                            .map(|n| n.total_rows())
+                            .unwrap_or(1000);
+                        let right_rows = self.graph.get_table_node(right_table)
+                            .map(|n| n.total_rows())
+                            .unwrap_or(1000);
+                        
+                        let result_rows = result.row_count;
+                        // Selectivity = result_rows / (left_rows * right_rows) for cartesian product
+                        // But for JOIN it's more like result_rows / max(left_rows, right_rows)
+                        let selectivity = if left_rows > 0 && right_rows > 0 {
+                            let max_rows = left_rows.max(right_rows);
+                            (result_rows as f64 / max_rows as f64).min(1.0)
+                        } else {
+                            0.1 // Default selectivity
+                        };
+                        
+                        // Track join statistics for both tables
+                        if let Err(e) = self.track_join_statistics(left_table, right_table, selectivity, result_rows) {
+                            eprintln!("Warning: Failed to track join statistics for {}.{}: {}", left_table, right_table, e);
+                        }
+                    }
+                }
+            }
+        }
         
         // 7. Cache result (if enabled)
         if use_result_cache {
@@ -2326,6 +2425,249 @@ impl HypergraphSQLEngine {
         }
 
         QueryClass::Other
+    }
+    
+    /// Compute and store column statistics in node metadata (Phase 1: Column-level statistics)
+    fn update_column_statistics(&mut self, table_name: &str, column_name: &str) -> Result<()> {
+        use crate::storage::statistics::*;
+        
+        // Get column node
+        let column_nodes = self.graph.get_column_nodes(table_name);
+        let column_node = column_nodes.iter()
+            .find(|n| n.column_name.as_ref().map(|c| c == column_name).unwrap_or(false))
+            .ok_or_else(|| anyhow::anyhow!("Column '{}' not found in table '{}'", column_name, table_name))?;
+        
+        // Get first fragment for this column
+        let fragment = column_node.fragments.first()
+            .ok_or_else(|| anyhow::anyhow!("Column '{}' has no fragments", column_name))?;
+        
+        let array = fragment.get_array()
+            .ok_or_else(|| anyhow::anyhow!("Column '{}' fragment has no array", column_name))?;
+        
+        let row_count = array.len();
+        
+        // Compute statistics
+        let mut null_count = 0;
+        let mut distinct_values = std::collections::HashSet::new();
+        let mut values = Vec::new();
+        
+        // Extract values from array using public API
+        use arrow::array::*;
+        use arrow::datatypes::DataType;
+        for i in 0..row_count {
+            let value = match array.data_type() {
+                DataType::Int64 => {
+                    let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+                    if arr.is_null(i) {
+                        crate::storage::fragment::Value::Null
+                    } else {
+                        crate::storage::fragment::Value::Int64(arr.value(i))
+                    }
+                }
+                DataType::Float64 => {
+                    let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
+                    if arr.is_null(i) {
+                        crate::storage::fragment::Value::Null
+                    } else {
+                        crate::storage::fragment::Value::Float64(arr.value(i))
+                    }
+                }
+                DataType::Utf8 => {
+                    let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
+                    if arr.is_null(i) {
+                        crate::storage::fragment::Value::Null
+                    } else {
+                        crate::storage::fragment::Value::String(arr.value(i).to_string())
+                    }
+                }
+                DataType::Boolean => {
+                    let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                    if arr.is_null(i) {
+                        crate::storage::fragment::Value::Null
+                    } else {
+                        crate::storage::fragment::Value::Bool(arr.value(i))
+                    }
+                }
+                _ => crate::storage::fragment::Value::Null,
+            };
+            if matches!(value, crate::storage::fragment::Value::Null) {
+                null_count += 1;
+            } else {
+                distinct_values.insert(format!("{:?}", value));
+                values.push(value);
+            }
+        }
+        
+        // Create column statistics
+        let stats = ColumnStatistics {
+            null_count,
+            distinct_count: distinct_values.len(),
+            histogram: None, // TODO: Build histogram from values
+            percentiles: None, // TODO: Compute percentiles from values
+            skew_indicator: 0.0, // TODO: Compute skew indicator
+            last_updated: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
+        };
+        
+        // Store in table node metadata
+        let table_node = self.graph.get_table_node(table_name)
+            .ok_or_else(|| anyhow::anyhow!("Table '{}' not found", table_name))?;
+        let table_node_id = table_node.id;
+        
+        let mut metadata_updates = HashMap::new();
+        let mut column_stats_map: HashMap<String, ColumnStatistics> = 
+            table_node.metadata.get("column_statistics")
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+        
+        column_stats_map.insert(column_name.to_string(), stats);
+        metadata_updates.insert("column_statistics".to_string(), serde_json::to_string(&column_stats_map)?);
+        
+        self.graph.update_node_metadata(table_node_id, metadata_updates);
+        
+        Ok(())
+    }
+    
+    /// Track access pattern for table/column (Phase 1: Access patterns)
+    fn track_access_pattern(&mut self, table_name: &str, column_name: Option<&str>) -> Result<()> {
+        use crate::storage::statistics::*;
+        
+        let table_node = self.graph.get_table_node(table_name)
+            .ok_or_else(|| anyhow::anyhow!("Table '{}' not found", table_name))?;
+        let table_node_id = table_node.id;
+        
+        // Get or create access pattern metadata
+        let mut access_pattern: AccessPatternMetadata = table_node.metadata.get("access_patterns")
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| AccessPatternMetadata::new());
+        
+        // Update access pattern
+        access_pattern.update_access(column_name);
+        
+        // Store in table node metadata
+        let mut metadata_updates = HashMap::new();
+        metadata_updates.insert("access_patterns".to_string(), serde_json::to_string(&access_pattern)?);
+        
+        self.graph.update_node_metadata(table_node_id, metadata_updates);
+        
+        Ok(())
+    }
+    
+    /// Track join statistics (Phase 2: Join statistics)
+    fn track_join_statistics(&mut self, table1: &str, table2: &str, selectivity: f64, cardinality: usize) -> Result<()> {
+        use crate::storage::statistics::*;
+        
+        // Update statistics for both tables
+        for table_name in &[table1, table2] {
+            let table_node = self.graph.get_table_node(table_name)
+                .ok_or_else(|| anyhow::anyhow!("Table '{}' not found", table_name))?;
+            let table_node_id = table_node.id;
+            
+            // Get or create join statistics
+            let mut join_stats: JoinStatistics = table_node.metadata.get("join_statistics")
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_else(|| JoinStatistics::new());
+            
+            // Update join statistics with partner
+            let partner = if *table_name == table1 { table2 } else { table1 };
+            join_stats.update_join(partner, selectivity, cardinality);
+            
+            // Store in table node metadata
+            let mut metadata_updates = HashMap::new();
+            metadata_updates.insert("join_statistics".to_string(), serde_json::to_string(&join_stats)?);
+            
+            self.graph.update_node_metadata(table_node_id, metadata_updates);
+        }
+        
+        Ok(())
+    }
+    
+    /// Store index metadata (Phase 1: Index metadata)
+    fn store_index_metadata(&mut self, table_name: &str, column_name: &str, index_type: &str, selectivity: f64, size_bytes: usize) -> Result<()> {
+        use crate::storage::statistics::*;
+        
+        let table_node = self.graph.get_table_node(table_name)
+            .ok_or_else(|| anyhow::anyhow!("Table '{}' not found", table_name))?;
+        let table_node_id = table_node.id;
+        
+        // Get or create index metadata map
+        let mut index_metadata_map: HashMap<String, Vec<IndexMetadata>> = 
+            table_node.metadata.get("index_metadata")
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+        
+        // Get or create index metadata list for this column
+        let mut indexes = index_metadata_map.remove(column_name).unwrap_or_default();
+        
+        // Find existing index of this type or create new
+        if let Some(existing) = indexes.iter_mut().find(|idx| idx.index_type == index_type) {
+            existing.selectivity = selectivity;
+            existing.size_bytes = size_bytes;
+            existing.last_used = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+        } else {
+            indexes.push(IndexMetadata {
+                index_type: index_type.to_string(),
+                selectivity,
+                size_bytes,
+                usage_count: 0,
+                last_used: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs(),
+                avg_speedup: 1.0,
+            });
+        }
+        
+        index_metadata_map.insert(column_name.to_string(), indexes);
+        
+        // Store in table node metadata
+        let mut metadata_updates = HashMap::new();
+        metadata_updates.insert("index_metadata".to_string(), serde_json::to_string(&index_metadata_map)?);
+        
+        self.graph.update_node_metadata(table_node_id, metadata_updates);
+        
+        Ok(())
+    }
+    
+    /// Store optimization hints (Phase 2: Query optimization hints)
+    fn store_optimization_hint(&mut self, table_name: &str, hint_type: &str, hint_value: serde_json::Value) -> Result<()> {
+        use crate::storage::statistics::*;
+        
+        let table_node = self.graph.get_table_node(table_name)
+            .ok_or_else(|| anyhow::anyhow!("Table '{}' not found", table_name))?;
+        let table_node_id = table_node.id;
+        
+        // Get or create optimization hints
+        let mut optimization_hints: OptimizationHints = table_node.metadata.get("optimization_hints")
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| OptimizationHints::new());
+        
+        // Update hint based on type
+        match hint_type {
+            "optimal_scan_strategy" => {
+                if let Some(strategy) = hint_value.as_str() {
+                    optimization_hints.optimal_scan_strategy = strategy.to_string();
+                }
+            }
+            "filter_selectivity" => {
+                if let (Some(filter), Some(selectivity)) = (hint_value.get("filter").and_then(|v| v.as_str()), hint_value.get("selectivity").and_then(|v| v.as_f64())) {
+                    optimization_hints.cache_filter_selectivity(filter, selectivity);
+                }
+            }
+            _ => {
+                // Other hint types
+            }
+        }
+        
+        // Store in table node metadata
+        let mut metadata_updates = HashMap::new();
+        metadata_updates.insert("optimization_hints".to_string(), serde_json::to_string(&optimization_hints)?);
+        
+        self.graph.update_node_metadata(table_node_id, metadata_updates);
+        
+        Ok(())
     }
 }
 

@@ -11,6 +11,7 @@ pub mod adaptive_fragment;
 pub mod tiered_index;
 pub mod compressed_execution;
 pub mod dictionary;
+pub mod statistics;
 
 pub use columnar::*;
 pub use fragment::*;
@@ -25,4 +26,5 @@ pub use adaptive_fragment::*;
 pub use tiered_index::*;
 pub use compressed_execution::*;
 pub use dictionary::*;
+pub use statistics::*;
 

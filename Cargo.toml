@@ -97,6 +97,10 @@ name = "test_window_query"
 path = "test_window_query.rs"
 
 [[bin]]
+name = "test_metadata_storage"
+path = "test_metadata_storage.rs"
+
+[[bin]]
 name = "test_vector_search"
 path = "test_vector_search.rs"
 

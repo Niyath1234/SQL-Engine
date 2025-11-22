@@ -350,6 +350,46 @@ impl HyperGraph {
         }
     }
     
+    /// Get table aliases from node metadata (alias -> table name)
+    pub fn get_table_aliases_from_metadata(&self, table_name: &str) -> HashMap<String, String> {
+        if let Some(table_node) = self.get_table_node(table_name) {
+            table_node.metadata.get("table_aliases")
+                .and_then(|s| serde_json::from_str::<HashMap<String, String>>(s).ok())
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        }
+    }
+    
+    /// Get alias names for a table from node metadata
+    pub fn get_alias_names_from_metadata(&self, table_name: &str) -> Vec<String> {
+        if let Some(table_node) = self.get_table_node(table_name) {
+            table_node.metadata.get("alias_names")
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    }
+    
+    /// Resolve alias to actual table name using stored metadata
+    pub fn resolve_alias_to_table(&self, alias: &str) -> Option<String> {
+        // Try to find the table node that has this alias in its metadata
+        for node_entry in self.nodes.iter() {
+            let node = node_entry.value();
+            if matches!(node.node_type, crate::hypergraph::node::NodeType::Table) {
+                if let Some(aliases_json) = node.metadata.get("table_aliases") {
+                    if let Ok(aliases) = serde_json::from_str::<HashMap<String, String>>(aliases_json) {
+                        if aliases.contains_key(alias) {
+                            return aliases.get(alias).cloned();
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+    
     /// Remove a node from the graph (for DROP TABLE)
     /// Also removes all related edges and updates indexes
     pub fn remove_node(&self, node_id: NodeId) -> anyhow::Result<()> {
