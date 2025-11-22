@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ]
     };
     
-    println!("🚀 Hypergraph SQL Engine vs PostgreSQL Benchmark");
+    println!(" Hypergraph SQL Engine vs PostgreSQL Benchmark");
     println!("{}", "=".repeat(80));
     println!("Loading data from: {}", csv_path);
     
@@ -73,17 +73,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let load_start = Instant::now();
     let (row_count, columns, fragments, csv_rows) = load_csv(csv_path)?;
     let load_time = load_start.elapsed();
-    println!("✓ Loaded {} rows, {} columns in {:?}", row_count, columns.len(), load_time);
+    println!(" Loaded {} rows, {} columns in {:?}", row_count, columns.len(), load_time);
     
     // Create hypergraph engine and load table
     let mut hg_engine = HypergraphSQLEngine::new();
     let table_load_start = Instant::now();
     hg_engine.load_table("enterprise_survey", fragments)?;
     let table_load_time = table_load_start.elapsed();
-    println!("✓ Table loaded into hypergraph in {:?}", table_load_time);
+    println!(" Table loaded into hypergraph in {:?}", table_load_time);
     
     // Connect to PostgreSQL
-    println!("\n📊 Connecting to PostgreSQL...");
+    println!("\n Connecting to PostgreSQL...");
     let username = std::env::var("USER").unwrap_or_else(|_| "postgres".to_string());
     let conn_strings = vec![
         format!("host=localhost user={} dbname=postgres", username),
@@ -110,29 +110,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         client.ok_or("Could not connect to PostgreSQL")?
     };
     
-    println!("✓ Connected to PostgreSQL");
+    println!(" Connected to PostgreSQL");
     
     // Load data into PostgreSQL
-    println!("📊 Loading data into PostgreSQL...");
+    println!(" Loading data into PostgreSQL...");
     let pg_load_start = Instant::now();
     load_into_postgres(&pg_client, &columns, &csv_rows).await?;
     let pg_load_time = pg_load_start.elapsed();
-    println!("✓ Data loaded into PostgreSQL in {:?}", pg_load_time);
+    println!(" Data loaded into PostgreSQL in {:?}", pg_load_time);
     
     // Connect to DuckDB
-    println!("\n📊 Connecting to DuckDB...");
+    println!("\n Connecting to DuckDB...");
     let duckdb_conn = Connection::open_in_memory()?;
-    println!("✓ Connected to DuckDB");
+    println!(" Connected to DuckDB");
     
     // Load data into DuckDB
-    println!("📊 Loading data into DuckDB...");
+    println!(" Loading data into DuckDB...");
     let duckdb_load_start = Instant::now();
     load_into_duckdb(&duckdb_conn, &columns, &csv_rows)?;
     let duckdb_load_time = duckdb_load_start.elapsed();
-    println!("✓ Data loaded into DuckDB in {:?}", duckdb_load_time);
+    println!(" Data loaded into DuckDB in {:?}", duckdb_load_time);
     
     println!("\n{}", "=".repeat(80));
-    println!("📊 Running Fair Benchmark Comparison");
+    println!(" Running Fair Benchmark Comparison");
     println!("{}", "=".repeat(80));
     println!("Each query runs 5 times (with 2 warmup runs) and we report the average");
     println!("Result cache is disabled for Hypergraph during benchmarking");
@@ -145,11 +145,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut results = Vec::new();
     
     for (i, query) in queries.iter().enumerate() {
-        println!("\n{} Query {}: {}", "─".repeat(40), i + 1, query);
-        println!("{}", "─".repeat(80));
+        println!("\n{} Query {}: {}", "".repeat(40), i + 1, query);
+        println!("{}", "".repeat(80));
         
         // Hypergraph Engine Benchmark
-        println!("🔷 Hypergraph Engine:");
+        println!(" Hypergraph Engine:");
         let mut hg_times = Vec::new();
         let mut hg_rows = 0;
         
@@ -182,7 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("  ✗ Error: {}", e);
+                    eprintln!("   Error: {}", e);
                     break;
                 }
             }
@@ -197,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if hg_times.len() > 1 {
             println!(" ... (avg of {} runs: {:.5}ms)", hg_times.len(), hg_avg);
         }
-        println!("  ✓ Average: {:.5}ms | Rows: {}", hg_avg, hg_rows);
+        println!("   Average: {:.5}ms | Rows: {}", hg_avg, hg_rows);
         
         // Display Hypergraph results
         if let Some(ref result) = hg_result_data {
@@ -205,7 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         
         // PostgreSQL Benchmark
-        println!("\n🔷 PostgreSQL:");
+        println!("\n PostgreSQL:");
         let mut pg_times = Vec::new();
         let mut pg_rows = 0;
         
@@ -230,7 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 Err(e) => {
                     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!("  ✗ Error: {} (took {:.5}ms)", e, elapsed);
+                    eprintln!("   Error: {} (took {:.5}ms)", e, elapsed);
                     break;
                 }
             }
@@ -245,7 +245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if pg_times.len() > 1 {
             println!(" ... (avg of {} runs: {:.5}ms)", pg_times.len(), pg_avg);
         }
-        println!("  ✓ Average: {:.5}ms | Rows: {}", pg_avg, pg_rows);
+        println!("   Average: {:.5}ms | Rows: {}", pg_avg, pg_rows);
         
         // Display PostgreSQL results
         if let Some(ref rows) = pg_result_rows {
@@ -253,7 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         
         // DuckDB Benchmark
-        println!("\n🔷 DuckDB:");
+        println!("\n DuckDB:");
         let mut duckdb_times = Vec::new();
         let mut duckdb_rows = 0;
         
@@ -309,14 +309,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         }
                         Err(e) => {
                             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-                            eprintln!("  ✗ Error: {} (took {:.5}ms)", e, elapsed);
+                            eprintln!("   Error: {} (took {:.5}ms)", e, elapsed);
                             break;
                         }
                     }
                 }
                 Err(e) => {
                     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!("  ✗ Error: {} (took {:.5}ms)", e, elapsed);
+                    eprintln!("   Error: {} (took {:.5}ms)", e, elapsed);
                     break;
                 }
             }
@@ -331,7 +331,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if duckdb_times.len() > 1 {
             println!(" ... (avg of {} runs: {:.5}ms)", duckdb_times.len(), duckdb_avg);
         }
-        println!("  ✓ Average: {:.5}ms | Rows: {}", duckdb_avg, duckdb_rows);
+        println!("   Average: {:.5}ms | Rows: {}", duckdb_avg, duckdb_rows);
         
         // Display DuckDB results
         if let Some(ref rows) = duckdb_result_data {
@@ -339,7 +339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         
         // Comparison
-        println!("\n📊 Comparison:");
+        println!("\n Comparison:");
         let speedup_vs_pg = if pg_avg > 0.0 && hg_avg > 0.0 {
             pg_avg / hg_avg
         } else if pg_avg > 0.0 {
@@ -357,15 +357,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
         
         if speedup_vs_pg > 1.0 {
-            println!("  🚀 Hypergraph Engine is {:.5}x FASTER than PostgreSQL", speedup_vs_pg);
+            println!("   Hypergraph Engine is {:.5}x FASTER than PostgreSQL", speedup_vs_pg);
         } else if speedup_vs_pg < 1.0 && speedup_vs_pg > 0.0 {
-            println!("  🐘 PostgreSQL is {:.5}x FASTER than Hypergraph", 1.0 / speedup_vs_pg);
+            println!("   PostgreSQL is {:.5}x FASTER than Hypergraph", 1.0 / speedup_vs_pg);
         }
         
         if speedup_vs_duckdb > 1.0 {
-            println!("  🚀 Hypergraph Engine is {:.5}x FASTER than DuckDB", speedup_vs_duckdb);
+            println!("   Hypergraph Engine is {:.5}x FASTER than DuckDB", speedup_vs_duckdb);
         } else if speedup_vs_duckdb < 1.0 && speedup_vs_duckdb > 0.0 {
-            println!("  🦆 DuckDB is {:.5}x FASTER than Hypergraph", 1.0 / speedup_vs_duckdb);
+            println!("   DuckDB is {:.5}x FASTER than Hypergraph", 1.0 / speedup_vs_duckdb);
         }
         
         results.push((query.clone(), hg_avg, pg_avg, duckdb_avg, speedup_vs_pg, speedup_vs_duckdb, hg_rows, pg_rows, duckdb_rows));
@@ -373,10 +373,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     
     // Final Summary
     println!("\n{}", "=".repeat(80));
-    println!("📈 FINAL SUMMARY");
+    println!(" FINAL SUMMARY");
     println!("{}", "=".repeat(80));
         println!("{:<50} {:>12} {:>12} {:>12} {:>12} {:>12}", "Query", "Hypergraph", "PostgreSQL", "DuckDB", "vs PG", "vs DuckDB");
-        println!("{}", "─".repeat(110));
+        println!("{}", "".repeat(110));
         
         let mut total_speedup_pg = 0.0;
         let mut total_speedup_duckdb = 0.0;
@@ -391,7 +391,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             };
             
             let speedup_pg_str = if *speedup_pg == f64::INFINITY {
-                "∞".to_string()
+                "".to_string()
             } else if *speedup_pg > 0.0 {
                 format!("{:.2}x", speedup_pg)
             } else {
@@ -399,7 +399,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             };
             
             let speedup_duckdb_str = if *speedup_duckdb == f64::INFINITY {
-                "∞".to_string()
+                "".to_string()
             } else if *speedup_duckdb > 0.0 {
                 format!("{:.2}x", speedup_duckdb)
             } else {
@@ -420,23 +420,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
     }
     
-        println!("{}", "─".repeat(110));
+        println!("{}", "".repeat(110));
         
         if valid_pg > 0 {
             let avg_speedup_pg = total_speedup_pg / valid_pg as f64;
-            println!("\n🎯 Average Speedup vs PostgreSQL: {:.5}x", avg_speedup_pg);
+            println!("\n Average Speedup vs PostgreSQL: {:.5}x", avg_speedup_pg);
         }
         
         if valid_duckdb > 0 {
             let avg_speedup_duckdb = total_speedup_duckdb / valid_duckdb as f64;
-            println!("🎯 Average Speedup vs DuckDB: {:.5}x", avg_speedup_duckdb);
+            println!(" Average Speedup vs DuckDB: {:.5}x", avg_speedup_duckdb);
             
             if avg_speedup_duckdb > 1.0 {
-                println!("🏆 WINNER: Hypergraph SQL Engine is {:.5}x faster than DuckDB on average!", avg_speedup_duckdb);
+                println!(" WINNER: Hypergraph SQL Engine is {:.5}x faster than DuckDB on average!", avg_speedup_duckdb);
             } else if avg_speedup_duckdb < 1.0 {
-                println!("🏆 WINNER: DuckDB is {:.5}x faster than Hypergraph on average!", 1.0 / avg_speedup_duckdb);
+                println!(" WINNER: DuckDB is {:.5}x faster than Hypergraph on average!", 1.0 / avg_speedup_duckdb);
             } else {
-                println!("⚖️  Hypergraph and DuckDB performed similarly!");
+                println!("  Hypergraph and DuckDB performed similarly!");
             }
         }
     
@@ -639,7 +639,7 @@ fn display_hypergraph_results(batches: &[hypergraph_sql_engine::execution::batch
         return;
     }
     
-    println!("\n  📋 Hypergraph Results (showing first {} rows):", max_rows);
+    println!("\n   Hypergraph Results (showing first {} rows):", max_rows);
     
     // Get schema from first batch
     let schema = &batches[0].batch.schema;
@@ -649,7 +649,7 @@ fn display_hypergraph_results(batches: &[hypergraph_sql_engine::execution::batch
     let header: Vec<String> = schema.fields().iter()
         .map(|f| f.name().clone())
         .collect();
-    println!("  {}", "─".repeat(80));
+    println!("  {}", "".repeat(80));
     print!("  ");
     for (idx, col_name) in header.iter().enumerate() {
         let display_name = if col_name.len() > 12 {
@@ -663,7 +663,7 @@ fn display_hypergraph_results(batches: &[hypergraph_sql_engine::execution::batch
         }
     }
     println!();
-    println!("  {}", "─".repeat(80));
+    println!("  {}", "".repeat(80));
     
     // Print rows
     let mut rows_printed = 0;
@@ -747,13 +747,13 @@ fn display_postgres_results(rows: &[tokio_postgres::Row], max_rows: usize) {
         return;
     }
     
-    println!("\n  📋 PostgreSQL Results (showing first {} rows):", max_rows);
+    println!("\n   PostgreSQL Results (showing first {} rows):", max_rows);
     
     // Get column count from first row
     let num_cols = rows[0].len();
     
     // Print header
-    println!("  {}", "─".repeat(80));
+    println!("  {}", "".repeat(80));
     print!("  ");
     for col_idx in 0..num_cols {
         let col_name = format!("col_{}", col_idx);
@@ -763,7 +763,7 @@ fn display_postgres_results(rows: &[tokio_postgres::Row], max_rows: usize) {
         }
     }
     println!();
-    println!("  {}", "─".repeat(80));
+    println!("  {}", "".repeat(80));
     
     // Print rows
     for (idx, row) in rows.iter().take(max_rows).enumerate() {
@@ -807,13 +807,13 @@ fn display_duckdb_results(rows: &[Vec<String>], max_rows: usize) {
         return;
     }
     
-    println!("\n  📋 DuckDB Results (showing first {} rows):", max_rows);
+    println!("\n   DuckDB Results (showing first {} rows):", max_rows);
     
     // Get column count from first row
     let num_cols = rows[0].len();
     
     // Print header
-    println!("  {}", "─".repeat(80));
+    println!("  {}", "".repeat(80));
     print!("  ");
     for col_idx in 0..num_cols {
         let col_name = format!("col_{}", col_idx);
@@ -823,7 +823,7 @@ fn display_duckdb_results(rows: &[Vec<String>], max_rows: usize) {
         }
     }
     println!();
-    println!("  {}", "─".repeat(80));
+    println!("  {}", "".repeat(80));
     
     // Print rows
     for row in rows.iter().take(max_rows) {

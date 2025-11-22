@@ -1,10 +1,9 @@
 /// Hypergraph Coarsening - Merge nodes and edges to reduce granularity
 /// Improves query performance by reducing graph size while preserving semantics
 use crate::hypergraph::graph::HyperGraph;
-use crate::hypergraph::node::{HyperNode, NodeId};
-use crate::hypergraph::edge::{HyperEdge, EdgeId};
+use crate::hypergraph::node::NodeId;
+use crate::hypergraph::edge::EdgeId;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 /// Coarsened hypergraph with merged nodes/edges
 pub struct CoarsenedHyperGraph {

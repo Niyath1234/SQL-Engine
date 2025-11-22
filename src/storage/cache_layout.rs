@@ -113,12 +113,17 @@ impl CacheOptimizedFragmentBuilder {
         let total_rows = array.len();
         let element_size = self.estimate_element_size(&array);
         
-        // Calculate how many rows fit in target fragment size
+        // Phase 2: Enforce micro-fragments (4-64k rows max for cache locality)
+        // This ensures fragments fit in L1/L2 cache and enable better pruning
+        const MIN_FRAGMENT_ROWS: usize = 4096;  // 4K minimum
+        const MAX_FRAGMENT_ROWS: usize = 65536; // 64K maximum
+        
         let rows_per_fragment = if element_size > 0 {
-            (self.target_size / element_size).max(1)
+            let calculated = (self.target_size / element_size).max(MIN_FRAGMENT_ROWS);
+            calculated.min(MAX_FRAGMENT_ROWS) // Cap at 64K rows
         } else {
             // For variable-length types, use a conservative estimate
-            8192 // 8K rows per fragment
+            8192.min(MAX_FRAGMENT_ROWS) // 8K rows per fragment, capped at 64K
         };
         
         let mut fragments = Vec::new();
@@ -135,26 +140,50 @@ impl CacheOptimizedFragmentBuilder {
             let mut header = FragmentHeader::new(length, memory_size);
             self.populate_header(&fragment_array, &mut header);
             
+            // Phase 2: Try dictionary encoding for low-cardinality columns
+            let (final_array, compression_type, dictionary) = 
+                if crate::storage::dictionary::should_dictionary_encode(&fragment_array, 65536) {
+                    // Try to dictionary-encode
+                    match crate::storage::dictionary::DictionaryEncodedFragment::from_array(&fragment_array) {
+                        Ok(dict_frag) => {
+                            // Use dictionary-encoded codes
+                            (dict_frag.codes.clone(), CompressionType::Dictionary, Some(dict_frag.dictionary))
+                        }
+                        Err(_) => {
+                            // Fall back to uncompressed
+                            (fragment_array.clone(), CompressionType::None, None)
+                        }
+                    }
+                } else {
+                    // Not a good candidate for dictionary encoding
+                    (fragment_array.clone(), CompressionType::None, None)
+                };
+            
             // Create fragment metadata
             let metadata = FragmentMetadata {
                 row_count: length,
                 min_value: header.min_value.clone(),
                 max_value: header.max_value.clone(),
                 cardinality: header.distinct_count,
-                compression: CompressionType::None,
+                compression: compression_type,
                 memory_size,
             };
             
             // Create fragment with cache-aligned layout
             // Ensure fragment data is aligned to 64-byte cache lines for SIMD
+            // Phase 2: Enforce micro-fragments (4-64k rows max)
             let fragment = ColumnFragment {
-                array: Some(fragment_array),
+                array: Some(final_array),
                 mmap: None, // Can be memory-mapped later if needed
                 mmap_offset: 0,
                 metadata,
                 bloom_filter: Some(header.bloom_bits.to_vec()),
                 bitmap_index: None,
                 is_sorted: header.is_sorted,
+                dictionary, // Set if dictionary-encoded
+                compressed_data: None,
+                vector_index: None,
+                vector_dimension: None,
             };
             
             fragments.push(fragment);

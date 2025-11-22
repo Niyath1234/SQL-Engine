@@ -126,11 +126,10 @@ impl SetOperator {
         let output_batch = crate::storage::columnar::ColumnarBatch::new(output_arrays, schema);
         let selection = bitvec![1; row_count];
         
-        Ok(Some(ExecutionBatch {
-            batch: output_batch,
-            selection,
-            row_count,
-        }))
+        let mut exec_batch = ExecutionBatch::new(output_batch);
+        exec_batch.selection = selection;
+        exec_batch.row_count = row_count;
+        Ok(Some(exec_batch))
     }
     
     fn execute_union_all(&mut self) -> Result<Option<ExecutionBatch>> {
@@ -215,11 +214,10 @@ impl SetOperator {
         let output_batch = crate::storage::columnar::ColumnarBatch::new(output_arrays, schema);
         let selection = bitvec![1; row_count];
         
-        Ok(Some(ExecutionBatch {
-            batch: output_batch,
-            selection,
-            row_count,
-        }))
+        let mut exec_batch = ExecutionBatch::new(output_batch);
+        exec_batch.selection = selection;
+        exec_batch.row_count = row_count;
+        Ok(Some(exec_batch))
     }
     
     fn execute_except(&mut self) -> Result<Option<ExecutionBatch>> {
@@ -282,11 +280,10 @@ impl SetOperator {
         let output_batch = crate::storage::columnar::ColumnarBatch::new(output_arrays, schema);
         let selection = bitvec![1; row_count];
         
-        Ok(Some(ExecutionBatch {
-            batch: output_batch,
-            selection,
-            row_count,
-        }))
+        let mut exec_batch = ExecutionBatch::new(output_batch);
+        exec_batch.selection = selection;
+        exec_batch.row_count = row_count;
+        Ok(Some(exec_batch))
     }
 }
 

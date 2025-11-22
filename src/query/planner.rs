@@ -36,28 +36,365 @@ impl QueryPlanner {
     
     /// Plan a query
     pub fn plan(&self, parsed: &ParsedQuery) -> Result<QueryPlan> {
-        // 0. Handle CTEs - check if any tables are actually CTEs
-        let mut actual_tables = parsed.tables.clone();
-        if let Some(ref cte_ctx) = self.cte_context {
-            // Filter out CTEs from table list (they'll be handled separately)
-            actual_tables.retain(|t| !cte_ctx.contains(t));
+        self.plan_with_ast(parsed, None)
+    }
+    
+    /// Plan a query with optional AST (for HAVING clause and window function parsing)
+    pub fn plan_with_ast(&self, parsed: &ParsedQuery, ast: Option<&sqlparser::ast::Statement>) -> Result<QueryPlan> {
+        // Plan normally first
+        let mut plan = self.plan_internal(parsed)?;
+        
+        // Add Window operator if window functions are present
+        if !parsed.window_functions.is_empty() {
+            // Convert WindowFunctionInfo to WindowFunctionExpr
+            use crate::query::plan::{WindowFunctionExpr, WindowFunction, OrderByExpr};
+            
+            let window_exprs: Vec<WindowFunctionExpr> = parsed.window_functions.iter().map(|wf_info| {
+                // Convert WindowFunctionType to WindowFunction
+                let win_func = match &wf_info.function {
+                    crate::query::parser::WindowFunctionType::RowNumber => WindowFunction::RowNumber,
+                    crate::query::parser::WindowFunctionType::Rank => WindowFunction::Rank,
+                    crate::query::parser::WindowFunctionType::DenseRank => WindowFunction::DenseRank,
+                    crate::query::parser::WindowFunctionType::Lag { offset } => WindowFunction::Lag { offset: *offset },
+                    crate::query::parser::WindowFunctionType::Lead { offset } => WindowFunction::Lead { offset: *offset },
+                    crate::query::parser::WindowFunctionType::SumOver => WindowFunction::SumOver,
+                    crate::query::parser::WindowFunctionType::AvgOver => WindowFunction::AvgOver,
+                    crate::query::parser::WindowFunctionType::MinOver => WindowFunction::MinOver,
+                    crate::query::parser::WindowFunctionType::MaxOver => WindowFunction::MaxOver,
+                    crate::query::parser::WindowFunctionType::CountOver => WindowFunction::CountOver,
+                    crate::query::parser::WindowFunctionType::FirstValue => WindowFunction::FirstValue,
+                    crate::query::parser::WindowFunctionType::LastValue => WindowFunction::LastValue,
+                };
+                
+                // Convert OrderByInfo to OrderByExpr
+                let order_by: Vec<OrderByExpr> = wf_info.order_by.iter().map(|o| {
+                    OrderByExpr {
+                        column: o.column.clone(),
+                        ascending: o.ascending,
+                    }
+                }).collect();
+                
+                WindowFunctionExpr {
+                    function: win_func,
+                    column: wf_info.column.clone(),
+                    alias: wf_info.alias.clone(),
+                    partition_by: wf_info.partition_by.clone(),
+                    order_by,
+                    frame: wf_info.frame.as_ref().map(|f| {
+                        crate::query::plan::WindowFrame {
+                            frame_type: match f.frame_type {
+                                crate::query::parser::FrameType::Rows => crate::query::plan::FrameType::Rows,
+                                crate::query::parser::FrameType::Range => crate::query::plan::FrameType::Range,
+                            },
+                            start: match &f.start {
+                                crate::query::parser::FrameBound::UnboundedPreceding => crate::query::plan::FrameBound::UnboundedPreceding,
+                                crate::query::parser::FrameBound::Preceding(n) => crate::query::plan::FrameBound::Preceding(*n),
+                                crate::query::parser::FrameBound::CurrentRow => crate::query::plan::FrameBound::CurrentRow,
+                                crate::query::parser::FrameBound::Following(n) => crate::query::plan::FrameBound::Following(*n),
+                                crate::query::parser::FrameBound::UnboundedFollowing => crate::query::plan::FrameBound::UnboundedFollowing,
+                            },
+                            end: f.end.as_ref().map(|e| {
+                                match e {
+                                    crate::query::parser::FrameBound::UnboundedPreceding => crate::query::plan::FrameBound::UnboundedPreceding,
+                                    crate::query::parser::FrameBound::Preceding(n) => crate::query::plan::FrameBound::Preceding(*n),
+                                    crate::query::parser::FrameBound::CurrentRow => crate::query::plan::FrameBound::CurrentRow,
+                                    crate::query::parser::FrameBound::Following(n) => crate::query::plan::FrameBound::Following(*n),
+                                    crate::query::parser::FrameBound::UnboundedFollowing => crate::query::plan::FrameBound::UnboundedFollowing,
+                                }
+                            }),
+                        }
+                    }),
+                }
+            }).collect();
+            
+            // Add Window operator BEFORE final projection but AFTER aggregation
+            // Window functions are computed after GROUP BY but before final SELECT projection
+            let window_op = PlanOperator::Window {
+                input: Box::new(plan.root),
+                window_functions: window_exprs,
+            };
+            plan.root = window_op;
         }
         
-        // 1. Find nodes for all tables (excluding CTEs)
-        let table_nodes = self.find_table_nodes(&actual_tables)?;
+        // Add HAVING operator if present and AST is available (HAVING comes after aggregation)
+        if let (Some(having_str), Some(ast_stmt)) = (&parsed.having, ast) {
+            if !having_str.is_empty() {
+                // Extract HAVING expression from AST
+                if let sqlparser::ast::Statement::Query(query) = ast_stmt {
+                    if let sqlparser::ast::SetExpr::Select(select) = &*query.body {
+                        if let Some(having_expr) = &select.having {
+                            // Convert SQL AST expression to our Expression type
+                            use crate::query::ast_to_expression::sql_expr_to_expression;
+                            match sql_expr_to_expression(having_expr) {
+                                Ok(mut having_expression) => {
+                                    // Rewrite aggregate function calls in HAVING to column references
+                                    // After aggregation, COUNT(*) becomes a column named "COUNT" or alias
+                                    having_expression = self.rewrite_having_expression(having_expression, &parsed.aggregates);
+                                    
+                                    // Wrap current plan with HavingOperator (after window functions)
+                                    let having_op = PlanOperator::Having {
+                                        input: Box::new(plan.root),
+                                        predicate: having_expression,
+                                    };
+                                    plan.root = having_op;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to parse HAVING clause: {}, skipping", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        plan.optimize();
+        Ok(plan)
+    }
+    
+    /// Internal plan method (moved from plan())
+    fn plan_internal(&self, parsed: &ParsedQuery) -> Result<QueryPlan> {
+        // Check if this is a set operation (UNION, INTERSECT, EXCEPT)
+        if let Some(set_op_str) = parsed.tables.first() {
+            if set_op_str.starts_with("__SET_OP_") {
+                return self.plan_set_operation(parsed);
+            }
+        }
+        
+        // 0. Handle CTEs - check if any tables are actually CTEs
+        let mut actual_tables = parsed.tables.clone();
+        let mut cte_tables = std::collections::HashSet::new();
+        if let Some(ref cte_ctx) = self.cte_context {
+            // Identify CTE tables but keep them in the list
+            for table in &parsed.tables {
+                if cte_ctx.contains(table) {
+                    cte_tables.insert(table.clone());
+                }
+            }
+            // Don't filter out CTEs - we'll handle them in build_plan_tree
+        }
+        
+        // 1. Find nodes for all non-CTE tables
+        let non_cte_tables: Vec<String> = actual_tables.iter()
+            .filter(|t| !cte_tables.contains(*t))
+            .cloned()
+            .collect();
+        let table_nodes = if non_cte_tables.is_empty() && !cte_tables.is_empty() {
+            // Only CTE tables - return empty nodes list
+            vec![]
+        } else {
+            self.find_table_nodes(&non_cte_tables)?
+        };
         
         // 2. Find join paths between tables
         let join_path = self.find_join_path(&parsed.joins, &table_nodes)?;
         
         // 3. Build plan tree
-        let root = self.build_plan_tree(parsed, &table_nodes, &join_path)?;
+        let mut root = self.build_plan_tree(parsed, &table_nodes, &join_path)?;
+        
+        // 3.5. Add DISTINCT if needed
+        if parsed.distinct {
+            root = PlanOperator::Distinct {
+                input: Box::new(root),
+            };
+        }
         
         // 4. Create plan
-        let mut plan = QueryPlan::new(root);
+        let mut plan = QueryPlan::new(root).with_table_aliases(parsed.table_aliases.clone());
+        
+        // 4.5. Detect vector operations and add index hints
+        use crate::query::optimizer::HypergraphOptimizer;
+        let optimizer = HypergraphOptimizer::new((*self.graph).clone());
+        plan.vector_index_hints = optimizer.detect_vector_operations(&plan);
         
         // 5. Optimize plan
         plan.optimize();
         
+        Ok(plan)
+    }
+    
+    /// Plan a set operation (UNION, INTERSECT, EXCEPT)
+    fn plan_set_operation(&self, parsed: &ParsedQuery) -> Result<QueryPlan> {
+        // Extract set operation type from first table
+        let set_op_type = if let Some(set_op_str) = parsed.tables.first() {
+            if set_op_str == "__SET_OP_UNION_ALL__" {
+                SetOperationType::UnionAll
+            } else if set_op_str == "__SET_OP_UNION__" {
+                SetOperationType::Union
+            } else if set_op_str == "__SET_OP_INTERSECT__" {
+                SetOperationType::Intersect
+            } else if set_op_str == "__SET_OP_EXCEPT__" {
+                SetOperationType::Except
+            } else {
+                anyhow::bail!("Unknown set operation: {}", set_op_str);
+            }
+        } else {
+            anyhow::bail!("Set operation marker not found");
+        };
+        
+        // The parser has already extracted left and right sides
+        // We need to plan them separately. Since we don't have the AST here,
+        // we'll need to reconstruct the queries from the parsed info.
+        // For now, we'll use a simpler approach: plan based on the parsed query structure
+        
+        // The parsed query contains info from the left side, and the right side tables
+        // are in parsed.tables[1..]. We need to plan both sides.
+        // However, without the full AST, we can't properly reconstruct the queries.
+        // So we'll need to pass the AST to the planner or store it in ParsedQuery.
+        
+        // For now, let's check if we can extract enough info from parsed
+        // The issue is that parsed only has info from the left side, not the right.
+        // We need to modify the parser to store both sides, or pass AST to planner.
+        
+        // TEMPORARY: Return an error indicating we need AST
+        // The proper fix would be to either:
+        // 1. Store left/right ParsedQuery in ParsedQuery struct
+        // 2. Pass AST to planner.plan() method
+        anyhow::bail!("Set operations require full query AST - needs engine integration")
+    }
+    
+    /// Rewrite HAVING expression to convert aggregate function calls to column references
+    fn rewrite_having_expression(&self, expr: crate::query::expression::Expression, aggregates: &[crate::query::parser::AggregateInfo]) -> crate::query::expression::Expression {
+        use crate::query::expression::Expression;
+        
+        match expr {
+            Expression::Function { name, args } => {
+                // Check if this is an aggregate function that should be converted to column reference
+                let upper_name = name.to_uppercase();
+                if upper_name == "COUNT" || upper_name == "SUM" || upper_name == "AVG" || upper_name == "MIN" || upper_name == "MAX" {
+                    // Check if there's a matching aggregate with alias
+                    for agg in aggregates {
+                        let agg_name = match agg.function {
+                            crate::query::parser::AggregateFunction::Count => "COUNT",
+                            crate::query::parser::AggregateFunction::Sum => "SUM",
+                            crate::query::parser::AggregateFunction::Avg => "AVG",
+                            crate::query::parser::AggregateFunction::Min => "MIN",
+                            crate::query::parser::AggregateFunction::Max => "MAX",
+                            crate::query::parser::AggregateFunction::CountDistinct => "COUNT",
+                        };
+                        
+                        if upper_name == agg_name {
+                            // Use alias if available (case-insensitive), otherwise use function name
+                            // Try to find the actual column name from schema - prefer alias but fall back to function name
+                            if let Some(ref alias) = agg.alias {
+                                // Use the alias as-is (preserve original case)
+                                return Expression::Column(alias.clone(), None);
+                            } else {
+                                // No alias - use function name (uppercase like "COUNT", "SUM")
+                                return Expression::Column(upper_name.clone(), None);
+                            }
+                        }
+                    }
+                    // No matching aggregate found - use function name as column name
+                    Expression::Column(upper_name, None)
+                } else {
+                    // Not an aggregate function - keep as function call but rewrite args
+                    Expression::Function {
+                        name,
+                        args: args.into_iter().map(|a| self.rewrite_having_expression(a, aggregates)).collect(),
+                    }
+                }
+            }
+            Expression::BinaryOp { left, op, right } => {
+                Expression::BinaryOp {
+                    left: Box::new(self.rewrite_having_expression(*left, aggregates)),
+                    op,
+                    right: Box::new(self.rewrite_having_expression(*right, aggregates)),
+                }
+            }
+            Expression::UnaryOp { op, expr } => {
+                Expression::UnaryOp {
+                    op,
+                    expr: Box::new(self.rewrite_having_expression(*expr, aggregates)),
+                }
+            }
+            Expression::Cast { expr, data_type } => {
+                Expression::Cast {
+                    expr: Box::new(self.rewrite_having_expression(*expr, aggregates)),
+                    data_type,
+                }
+            }
+            Expression::Case { operand, conditions, else_result } => {
+                Expression::Case {
+                    operand: operand.map(|e| Box::new(self.rewrite_having_expression(*e, aggregates))),
+                    conditions: conditions.into_iter().map(|(c, r)| {
+                        (self.rewrite_having_expression(c, aggregates), self.rewrite_having_expression(r, aggregates))
+                    }).collect(),
+                    else_result: else_result.map(|e| Box::new(self.rewrite_having_expression(*e, aggregates))),
+                }
+            }
+            other => other, // Literals, columns, etc. don't need rewriting
+        }
+    }
+    
+    /// Plan a set operation with AST (called from engine)
+    pub fn plan_set_operation_with_ast(&self, ast: &sqlparser::ast::Statement, parsed: &ParsedQuery) -> Result<QueryPlan> {
+        use sqlparser::ast::*;
+        
+        // Extract set operation from AST
+        let (set_op, left_body, right_body, is_union_all) = if let Statement::Query(query) = ast {
+            if let SetExpr::SetOperation { op, left, right, set_quantifier } = &*query.body {
+                let is_all = matches!(set_quantifier, sqlparser::ast::SetQuantifier::All);
+                (op, left.clone(), right.clone(), is_all)
+            } else {
+                anyhow::bail!("Not a set operation");
+            }
+        } else {
+            anyhow::bail!("Not a query statement");
+        };
+        
+        // Determine set operation type
+        let set_op_type = match set_op {
+            sqlparser::ast::SetOperator::Union => {
+                if is_union_all {
+                    SetOperationType::UnionAll
+                } else {
+                    SetOperationType::Union
+                }
+            }
+            sqlparser::ast::SetOperator::Intersect => SetOperationType::Intersect,
+            sqlparser::ast::SetOperator::Except => SetOperationType::Except,
+        };
+        
+        // Parse and plan left side
+        let left_ast = Statement::Query(Box::new(Query {
+            body: left_body,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            fetch: None,
+            locks: vec![],
+            with: None,
+            for_clause: None,
+            limit_by: vec![],
+        }));
+        let left_parsed = crate::query::parser_enhanced::extract_query_info_enhanced(&left_ast)?;
+        let left_plan = self.plan(&left_parsed)?;
+        
+        // Parse and plan right side
+        let right_ast = Statement::Query(Box::new(Query {
+            body: right_body,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            fetch: None,
+            locks: vec![],
+            with: None,
+            for_clause: None,
+            limit_by: vec![],
+        }));
+        let right_parsed = crate::query::parser_enhanced::extract_query_info_enhanced(&right_ast)?;
+        let right_plan = self.plan(&right_parsed)?;
+        
+        // Combine with SetOperation
+        let root = PlanOperator::SetOperation {
+            left: Box::new(left_plan.root),
+            right: Box::new(right_plan.root),
+            operation: set_op_type,
+        };
+        
+        let mut plan = QueryPlan::new(root);
+        plan.optimize();
         Ok(plan)
     }
     
@@ -111,8 +448,82 @@ impl QueryPlanner {
         let mut edges = vec![];
         
         for join in joins {
-            // Find edge matching this join
-            // TODO: Implement edge lookup
+            // Find edge matching this join predicate
+            // We need to find an edge that connects the two tables with the matching columns
+            
+            // Find nodes for the join columns
+            let left_node = self.graph.get_node_by_table_column(&join.left_table, &join.left_column);
+            let right_node = self.graph.get_node_by_table_column(&join.right_table, &join.right_column);
+            
+            if let (Some(left_node), Some(right_node)) = (left_node, right_node) {
+                let mut found_edge = false;
+                
+                // Try to find an edge between these nodes that matches the predicate
+                // Check outgoing edges from left node
+                let outgoing_edges = self.graph.get_outgoing_edges(left_node.id);
+                for edge in outgoing_edges {
+                    if edge.target == right_node.id && 
+                       edge.matches_predicate(&join.left_table, &join.left_column, &join.right_table, &join.right_column) {
+                        edges.push(edge.id);
+                        found_edge = true;
+                        break;
+                    }
+                }
+                
+                // If not found in outgoing, check incoming edges
+                if !found_edge {
+                    let incoming_edges = self.graph.get_incoming_edges(left_node.id);
+                    for edge in incoming_edges {
+                        if edge.source == right_node.id && 
+                           edge.matches_predicate(&join.right_table, &join.right_column, &join.left_table, &join.left_column) {
+                            edges.push(edge.id);
+                            found_edge = true;
+                            break;
+                        }
+                    }
+                }
+                
+                // If still not found, check edges from right to left
+                if !found_edge {
+                    let outgoing_from_right = self.graph.get_outgoing_edges(right_node.id);
+                    for edge in outgoing_from_right {
+                        if edge.target == left_node.id && 
+                           edge.matches_predicate(&join.right_table, &join.right_column, &join.left_table, &join.left_column) {
+                            edges.push(edge.id);
+                            found_edge = true;
+                            break;
+                        }
+                    }
+                }
+                
+                // If no edge found at column level, try table-level edges
+                if !found_edge {
+                    if let (Some(left_table_node), Some(right_table_node)) = (
+                        self.graph.get_table_node(&join.left_table),
+                        self.graph.get_table_node(&join.right_table)
+                    ) {
+                        // Check outgoing edges from left table node
+                        let table_edges = self.graph.get_outgoing_edges(left_table_node.id);
+                        for edge in table_edges {
+                            if edge.target == right_table_node.id {
+                                edges.push(edge.id);
+                                found_edge = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // If still not found, warn but continue
+                // The join operator will handle the join without a pre-defined edge
+                if !found_edge {
+                    tracing::warn!(
+                        "No edge found for join: {}.{} = {}.{} - join will proceed without pre-defined edge",
+                        join.left_table, join.left_column,
+                        join.right_table, join.right_column
+                    );
+                }
+            }
         }
         
         Ok(edges)
@@ -124,33 +535,91 @@ impl QueryPlanner {
         table_nodes: &[NodeId],
         join_path: &[EdgeId],
     ) -> Result<PlanOperator> {
-        // Push LIMIT/OFFSET down to scan for early termination optimization
-        // This allows ScanOperator to stop processing fragments early
-        let scan_limit = parsed.limit;
-        let scan_offset = parsed.offset;
-        
-        // Start with scan operators
-        let mut current_op = if let Some(node_id) = table_nodes.first() {
-            PlanOperator::Scan {
-                node_id: *node_id,
-                table: parsed.tables[0].clone(),
-                columns: parsed.columns.clone(),
-                limit: scan_limit,  // Push LIMIT down to scan
-                offset: scan_offset, // Push OFFSET down to scan
-            }
+        // Only push LIMIT/OFFSET down to scan when there's NO aggregation
+        // When there's GROUP BY or aggregates, LIMIT must be applied AFTER aggregation
+        let has_aggregation = !parsed.aggregates.is_empty() || !parsed.group_by.is_empty();
+        let scan_limit = if has_aggregation {
+            None  // Don't push LIMIT to scan when aggregating - must apply after GROUP BY
         } else {
-            anyhow::bail!("No tables in query");
+            parsed.limit  // Can push LIMIT down to scan for optimization when no aggregation
+        };
+        let scan_offset = if has_aggregation {
+            None  // Don't push OFFSET to scan when aggregating
+        } else {
+            parsed.offset
+        };
+        
+        // Start with scan operators - check if first table is a CTE
+        let first_table = &parsed.tables[0];
+        let mut current_op = {
+            // Check if this is a CTE reference first (before checking table_nodes)
+            if let Some(ref cte_ctx) = self.cte_context {
+                if cte_ctx.contains(first_table) {
+                    // This is a CTE - create CTEScan operator
+                    PlanOperator::CTEScan {
+                        cte_name: first_table.clone(),
+                        columns: parsed.columns.clone(),
+                        limit: scan_limit,
+                        offset: scan_offset,
+                    }
+                } else if let Some(node_id) = table_nodes.first() {
+                    // Regular table scan
+                    PlanOperator::Scan {
+                        node_id: *node_id,
+                        table: first_table.clone(),
+                        columns: parsed.columns.clone(),
+                        limit: scan_limit,  // Only pushed when no aggregation
+                        offset: scan_offset,
+                    }
+                } else {
+                    anyhow::bail!("Table '{}' not found and is not a CTE", first_table);
+                }
+            } else if let Some(node_id) = table_nodes.first() {
+                // No CTE context - regular table scan
+                PlanOperator::Scan {
+                    node_id: *node_id,
+                    table: first_table.clone(),
+                    columns: parsed.columns.clone(),
+                    limit: scan_limit,  // Only pushed when no aggregation
+                    offset: scan_offset,
+                }
+            } else {
+                anyhow::bail!("No tables in query");
+            }
         };
         
         // Add joins
         for (i, edge_id) in join_path.iter().enumerate() {
             if i + 1 < table_nodes.len() {
-                let right_op = PlanOperator::Scan {
-                    node_id: table_nodes[i + 1],
-                    table: parsed.tables[i + 1].clone(),
-                    columns: parsed.columns.clone(),
-                    limit: None,  // Joins don't push LIMIT to right side (would be incorrect)
-                    offset: None,
+                let right_table = &parsed.tables[i + 1];
+                let right_op = if let Some(ref cte_ctx) = self.cte_context {
+                    if cte_ctx.contains(right_table) {
+                        // Right table is a CTE
+                        PlanOperator::CTEScan {
+                            cte_name: right_table.clone(),
+                            columns: parsed.columns.clone(),
+                            limit: None,  // Joins don't push LIMIT to right side
+                            offset: None,
+                        }
+                    } else {
+                        // Regular table scan
+                        PlanOperator::Scan {
+                            node_id: table_nodes[i + 1],
+                            table: right_table.clone(),
+                            columns: parsed.columns.clone(),
+                            limit: None,  // Joins don't push LIMIT to right side (would be incorrect)
+                            offset: None,
+                        }
+                    }
+                } else {
+                    // No CTE context - regular table scan
+                    PlanOperator::Scan {
+                        node_id: table_nodes[i + 1],
+                        table: right_table.clone(),
+                        columns: parsed.columns.clone(),
+                        limit: None,  // Joins don't push LIMIT to right side (would be incorrect)
+                        offset: None,
+                    }
                 };
                 
                 // Extract join predicate and type from parsed query
@@ -209,6 +678,8 @@ impl QueryPlanner {
                     crate::query::parser::FilterOperator::NotLike => PredicateOperator::NotLike,
                     crate::query::parser::FilterOperator::In => PredicateOperator::In,
                     crate::query::parser::FilterOperator::NotIn => PredicateOperator::NotIn,
+                    crate::query::parser::FilterOperator::IsNull => PredicateOperator::IsNull,
+                    crate::query::parser::FilterOperator::IsNotNull => PredicateOperator::IsNotNull,
                     _ => PredicateOperator::Equals, // Default for Between, etc.
                 };
                 
@@ -268,6 +739,7 @@ impl QueryPlanner {
                     },
                     column: a.column.clone(),
                     alias: a.alias.clone(),
+                    cast_type: a.cast_type.clone(),
                 }
             }).collect();
             
@@ -278,25 +750,46 @@ impl QueryPlanner {
                 having: parsed.having.clone(),
             };
             
-            // Add HAVING clause as a filter after aggregation (if present)
-            if let Some(having_pred) = &parsed.having {
-                // Use HavingOperator to filter groups
-                // For now, we'll add it as a separate filter operator
-                // TODO: Parse HAVING predicate into FilterPredicate
-            }
+            // HAVING clause will be added as HavingOperator after aggregate
+            // This is handled in plan_with_ast() method when AST is available
         }
         
         // Add projection
-        if !parsed.columns.is_empty() {
+        if !parsed.columns.is_empty() || !parsed.projection_expressions.is_empty() {
+            // Convert projection expressions to plan format
+            let expressions: Vec<crate::query::plan::ProjectionExpr> = parsed.projection_expressions.iter().map(|expr| {
+                crate::query::plan::ProjectionExpr {
+                    alias: expr.alias.clone(),
+                    expr_type: match &expr.expr_type {
+                        crate::query::parser::ProjectionExprTypeInfo::Column(col) => {
+                            crate::query::plan::ProjectionExprType::Column(col.clone())
+                        }
+                        crate::query::parser::ProjectionExprTypeInfo::Cast { column, target_type } => {
+                            crate::query::plan::ProjectionExprType::Cast {
+                                column: column.clone(),
+                                target_type: target_type.clone(),
+                            }
+                        }
+                        crate::query::parser::ProjectionExprTypeInfo::Case(case_expr) => {
+                            crate::query::plan::ProjectionExprType::Case(case_expr.clone())
+                        }
+                        crate::query::parser::ProjectionExprTypeInfo::Expression(func_expr) => {
+                            crate::query::plan::ProjectionExprType::Function(func_expr.clone())
+                        }
+                    }
+                }
+            }).collect();
+            
             current_op = PlanOperator::Project {
                 input: Box::new(current_op),
                 columns: parsed.columns.clone(),
+                expressions,
             };
         }
         
         // Add sort
         if !parsed.order_by.is_empty() {
-            let order_by = parsed.order_by.iter().map(|o| {
+            let order_by: Vec<OrderByExpr> = parsed.order_by.iter().map(|o| {
                 OrderByExpr {
                     column: o.column.clone(),
                     ascending: o.ascending,

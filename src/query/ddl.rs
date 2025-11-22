@@ -36,7 +36,10 @@ pub fn extract_create_table(statement: &Statement) -> Result<CreateTableStatemen
             let mut column_defs = vec![];
             for col in columns {
                 let col_name = col.name.value.clone();
+                
+                // Convert SQL type to Arrow type
                 let data_type = sql_type_to_arrow_type(&col.data_type)?;
+                
                 let nullable = !col.options.iter().any(|opt| {
                     matches!(opt.option, ColumnOption::NotNull { .. })
                 });
@@ -104,6 +107,22 @@ fn sql_type_to_arrow_type(sql_type: &sqlparser::ast::DataType) -> Result<ArrowDa
         sqlparser::ast::DataType::Real => Ok(ArrowDataType::Float64),
         sqlparser::ast::DataType::Char(_) | sqlparser::ast::DataType::Varchar(_) | sqlparser::ast::DataType::Text => Ok(ArrowDataType::Utf8),
         sqlparser::ast::DataType::Boolean => Ok(ArrowDataType::Boolean),
+        sqlparser::ast::DataType::Timestamp(_, _) => {
+            // Store timestamps as Int64 (milliseconds since epoch)
+            Ok(ArrowDataType::Int64)
+        },
+        sqlparser::ast::DataType::Custom(name, _) => {
+            // Handle custom types like UUID
+            let type_name = name.0.iter()
+                .map(|ident| ident.value.clone())
+                .collect::<Vec<_>>()
+                .join(".");
+            if type_name.eq_ignore_ascii_case("uuid") {
+                Ok(ArrowDataType::Utf8) // Store UUIDs as strings
+            } else {
+                anyhow::bail!("Unsupported custom data type: {}", type_name)
+            }
+        },
         _ => anyhow::bail!("Unsupported data type: {:?}", sql_type),
     }
 }
@@ -126,7 +145,53 @@ fn extract_default_value(expr: &Expr) -> Result<FragmentValue> {
             sqlparser::ast::Value::Null => Ok(FragmentValue::Null),
             _ => anyhow::bail!("Unsupported default value"),
         }
-        _ => anyhow::bail!("Only literal default values supported"),
+        Expr::Function(func) => {
+            // Handle function calls like NOW(), CURRENT_TIMESTAMP, etc.
+            let func_name = func.name.to_string().to_uppercase();
+            match func_name.as_str() {
+                "NOW" | "CURRENT_TIMESTAMP" | "CURRENT_TIMESTAMP()" => {
+                    // Return current timestamp in milliseconds since epoch
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64;
+                    Ok(FragmentValue::Int64(now_ms))
+                }
+                "CURRENT_DATE" | "CURRENT_DATE()" => {
+                    // Return current date as string (YYYY-MM-DD)
+                    // Use system time and format manually
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    // Simple date formatting (approximate)
+                    let days = now / 86400;
+                    let epoch_days = days as i64 - 719163; // Days since 1970-01-01
+                    // Approximate date calculation
+                    let year = 1970 + (epoch_days / 365);
+                    let day_of_year = epoch_days % 365;
+                    let month = (day_of_year / 30) + 1;
+                    let day = (day_of_year % 30) + 1;
+                    let date_str = format!("{:04}-{:02}-{:02}", year, month, day);
+                    Ok(FragmentValue::String(date_str))
+                }
+                "CURRENT_TIME" | "CURRENT_TIME()" => {
+                    // Return current time as string (HH:MM:SS)
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let seconds_in_day = now % 86400;
+                    let hours = seconds_in_day / 3600;
+                    let minutes = (seconds_in_day % 3600) / 60;
+                    let secs = seconds_in_day % 60;
+                    let time_str = format!("{:02}:{:02}:{:02}", hours, minutes, secs);
+                    Ok(FragmentValue::String(time_str))
+                }
+                _ => anyhow::bail!("Unsupported default function: {}", func_name),
+            }
+        }
+        _ => anyhow::bail!("Only literal default values or NOW()/CURRENT_TIMESTAMP supported"),
     }
 }
 

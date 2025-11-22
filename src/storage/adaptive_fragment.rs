@@ -1,8 +1,7 @@
 /// Adaptive fragmenting and recompression
 /// Dynamically adjusts fragment sizes and compression based on access patterns
-use crate::storage::fragment::{ColumnFragment, FragmentMetadata, CompressionType};
-use crate::storage::memory_tier::{MemoryTier, FragmentAccessStats};
-use crate::hypergraph::node::NodeId;
+use crate::storage::fragment::{ColumnFragment, CompressionType};
+use crate::storage::memory_tier::FragmentAccessStats;
 use arrow::array::*;
 use arrow::datatypes::*;
 use std::sync::Arc;
@@ -240,6 +239,10 @@ impl AdaptiveFragmentManager {
                 bloom_filter: fragment.bloom_filter.clone(),
                 bitmap_index: fragment.bitmap_index.clone(),
                 is_sorted: fragment.is_sorted,
+                dictionary: fragment.dictionary.clone(),
+                compressed_data: None,
+                vector_index: fragment.vector_index.clone(),
+                vector_dimension: fragment.vector_dimension,
             };
             
             fragments.push(new_fragment);
@@ -287,6 +290,10 @@ impl AdaptiveFragmentManager {
             bloom_filter: first_fragment.bloom_filter.clone(),
             bitmap_index: first_fragment.bitmap_index.clone(),
             is_sorted: first_fragment.is_sorted,
+            dictionary: first_fragment.dictionary.clone(),
+            compressed_data: None,
+            vector_index: first_fragment.vector_index.clone(),
+            vector_dimension: first_fragment.vector_dimension,
         })
     }
     

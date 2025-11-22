@@ -1,8 +1,0 @@
-SELECT * FROM enterprise_survey LIMIT 10
-SELECT * FROM enterprise_survey LIMIT 100
-SELECT * FROM enterprise_survey LIMIT 1000
-SELECT * FROM enterprise_survey LIMIT 10000
-SELECT COUNT(*) FROM enterprise_survey
-SELECT * FROM enterprise_survey WHERE "Year" = '2024'
-SELECT * FROM enterprise_survey ORDER BY "Year" LIMIT 100
-

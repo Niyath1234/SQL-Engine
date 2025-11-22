@@ -9,7 +9,7 @@ sqlparser = "0.40"
 
 # Columnar Data & Arrow (for efficient columnar operations)
 arrow = { version = "57", features = [] }
-parquet = "57"
+parquet = "57"  # Used for result export in execution/result.rs
 
 # SIMD Operations
 # Note: portable-simd requires nightly, using manual SIMD intrinsics instead
@@ -33,9 +33,9 @@ lz4 = "1.24"
 ahash = "0.8"  # Fast hashing
 bitvec = "1"   # Bitmap operations
 fxhash = "0.2" # Fast hash functions
-murmurhash3 = "0.0.5" # Fast hashing for joins
 ordered-float = "2" # Ordered floats for sorting
 regex = "1"    # Pattern matching for LIKE operator
+rand = "0.8"   # Random number generation for HNSW level assignment
 
 # Error Handling
 anyhow = "1"
@@ -43,6 +43,11 @@ thiserror = "1"
 
 # Async runtime (needed for PostgreSQL and DuckDB)
 tokio = { version = "1", features = ["full"] }
+
+# Web framework for admin UI
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["fs", "cors"] }
 
 # CSV Parsing
 csv = "1.3"
@@ -54,29 +59,64 @@ tokio-postgres = "0.7"
 # DuckDB (high-performance analytical database)
 duckdb = { version = "1.0", features = ["bundled"] }
 
-# Logging
+# Logging (used in query planner)
 tracing = "0.1"
-tracing-subscriber = "0.3"
 
 # Memory Management
-bumpalo = "3"  # Fast allocator for temporary data
 memmap2 = "0.9"  # Memory-mapped files for zero-copy fragment access
-
-# Metrics & Profiling
-criterion = "0.5"
 
 [dev-dependencies]
 criterion = "0.5"
 
-[[bench]]
-name = "query_bench"
-harness = false
+[[bin]]
+name = "compare_engines"
+path = "src/bin/compare_engines.rs"
+
+[[bin]]
+name = "web_admin"
+path = "src/bin/web_admin.rs"
+
+[[bin]]
+name = "sql_repl"
+path = "src/bin/sql_repl.rs"
+
+[[bin]]
+name = "test_order_by_fix"
+path = "test_order_by_fix.rs"
+
+[[bin]]
+name = "test_all_features"
+path = "test_all_features.rs"
+
+[[bin]]
+name = "test_query_output"
+path = "test_query_output.rs"
+
+[[bin]]
+name = "test_window_query"
+path = "test_window_query.rs"
+
+[[bin]]
+name = "test_vector_search"
+path = "test_vector_search.rs"
+
+[[bin]]
+name = "test_comprehensive"
+path = "test_comprehensive.rs"
+
+[[bin]]
+name = "test_dtype_fix"
+path = "test_dtype_fix.rs"
+
+[[bin]]
+name = "test_set_operations"
+path = "test_set_operations.rs"
+
+[[bin]]
+name = "test_transactions"
+path = "test_transactions.rs"
 
 [[bin]]
 name = "benchmark"
 path = "src/bin/benchmark.rs"
-
-[[bin]]
-name = "compare_engines"
-path = "src/bin/compare_engines.rs"
 

@@ -101,31 +101,134 @@ pub enum UnaryOperator {
     BitwiseNot,
 }
 
+/// Subquery executor trait - allows ExpressionEvaluator to execute subqueries
+pub trait SubqueryExecutor: Send + Sync {
+    /// Execute a scalar subquery and return the first value
+    /// Returns None if subquery returns no rows, Some(Value) if it returns one row/column
+    fn execute_scalar_subquery(
+        &self,
+        subquery: &Box<sqlparser::ast::Query>,
+        outer_context: Option<&ExecutionBatch>,  // For correlated subqueries
+    ) -> Result<Option<Value>>;
+    
+    /// Execute an EXISTS subquery and return true/false
+    fn execute_exists_subquery(
+        &self,
+        subquery: &Box<sqlparser::ast::Query>,
+        outer_context: Option<&ExecutionBatch>,  // For correlated subqueries
+    ) -> Result<bool>;
+}
+
 /// Expression evaluator
 pub struct ExpressionEvaluator {
     /// Schema for resolving column references
     schema: SchemaRef,
+    /// Optional subquery executor (for scalar/EXISTS subqueries)
+    subquery_executor: Option<Arc<dyn SubqueryExecutor>>,
+    /// Table alias mapping: alias -> actual table name (e.g., "d" -> "documents")
+    table_aliases: std::collections::HashMap<String, String>,
 }
 
 impl ExpressionEvaluator {
     pub fn new(schema: SchemaRef) -> Self {
-        Self { schema }
+        Self {
+            schema,
+            subquery_executor: None,
+            table_aliases: std::collections::HashMap::new(),
+        }
+    }
+    
+    /// Create evaluator with subquery executor support
+    pub fn with_subquery_executor(
+        schema: SchemaRef,
+        executor: Arc<dyn SubqueryExecutor>,
+    ) -> Self {
+        Self {
+            schema,
+            subquery_executor: Some(executor),
+            table_aliases: std::collections::HashMap::new(),
+        }
+    }
+    
+    /// Create evaluator with table alias mapping
+    pub fn with_table_aliases(
+        schema: SchemaRef,
+        table_aliases: std::collections::HashMap<String, String>,
+    ) -> Self {
+        Self {
+            schema,
+            subquery_executor: None,
+            table_aliases,
+        }
+    }
+    
+    /// Create evaluator with both subquery executor and table alias mapping
+    pub fn with_subquery_executor_and_aliases(
+        schema: SchemaRef,
+        executor: Arc<dyn SubqueryExecutor>,
+        table_aliases: std::collections::HashMap<String, String>,
+    ) -> Self {
+        Self {
+            schema,
+            subquery_executor: Some(executor),
+            table_aliases,
+        }
     }
     
     /// Evaluate expression for a single row
-    pub fn evaluate(&self, expr: &Expression, batch: &ExecutionBatch, row_idx: usize) -> Result<Value> {
+    /// For subqueries, outer_context can be provided for correlated subquery support
+    pub fn evaluate(
+        &self,
+        expr: &Expression,
+        batch: &ExecutionBatch,
+        row_idx: usize,
+    ) -> Result<Value> {
+        self.evaluate_with_context(expr, batch, row_idx, Some(batch))
+    }
+    
+    /// Evaluate expression with optional outer context (for correlated subqueries)
+    pub fn evaluate_with_context(
+        &self,
+        expr: &Expression,
+        batch: &ExecutionBatch,
+        row_idx: usize,
+        outer_context: Option<&ExecutionBatch>,
+    ) -> Result<Value> {
         match expr {
             Expression::Column(col_name, table_name) => {
                 // Find column in schema
                 let col_idx = if let Some(table) = table_name {
                     // Qualified column: table.column
+                    // First, try to resolve table alias to actual table name
+                    let actual_table = self.table_aliases.get(table).map(|s| s.as_str()).unwrap_or(table);
+                    
+                    // Try different formats:
+                    // 1. alias.column (e.g., "d.id")
+                    // 2. actual_table.column (e.g., "documents.id")
+                    // 3. column (e.g., "id")
                     self.schema.index_of(&format!("{}.{}", table, col_name))
+                        .or_else(|_| self.schema.index_of(&format!("{}.{}", actual_table, col_name)))
                         .or_else(|_| self.schema.index_of(col_name))
                 } else {
-                    // Unqualified column
+                    // Unqualified column - try case-sensitive first, then case-insensitive
                     self.schema.index_of(col_name)
+                        .or_else(|_| {
+                            // Try case-insensitive match (for aggregate columns like COUNT vs count)
+                            let upper_col = col_name.to_uppercase();
+                            let lower_col = col_name.to_lowercase();
+                            self.schema.index_of(&upper_col)
+                                .or_else(|_| self.schema.index_of(&lower_col))
+                                .or_else(|_| {
+                                    // Try finding by case-insensitive partial match
+                                    (0..self.schema.fields().len()).find(|&idx| {
+                                        let field_name = self.schema.field(idx).name();
+                                        field_name.to_uppercase() == upper_col || 
+                                        field_name.to_lowercase() == lower_col
+                                    }).ok_or_else(|| arrow::error::ArrowError::SchemaError(format!("Column not found: {}", col_name)))
+                                })
+                        })
                 }
-                .map_err(|_| anyhow::anyhow!("Column not found: {}", col_name))?;
+                .map_err(|e| anyhow::anyhow!("Column not found: {} ({})", col_name, e))?;
                 
                 // Get value from batch
                 let array = batch.batch.column(col_idx)
@@ -135,28 +238,28 @@ impl ExpressionEvaluator {
             }
             Expression::Literal(val) => Ok(val.clone()),
             Expression::BinaryOp { left, op, right } => {
-                let left_val = self.evaluate(left, batch, row_idx)?;
-                let right_val = self.evaluate(right, batch, row_idx)?;
+                let left_val = self.evaluate_with_context(left, batch, row_idx, outer_context)?;
+                let right_val = self.evaluate_with_context(right, batch, row_idx, outer_context)?;
                 evaluate_binary_op(op, &left_val, &right_val)
             }
             Expression::UnaryOp { op, expr } => {
-                let val = self.evaluate(expr, batch, row_idx)?;
+                let val = self.evaluate_with_context(expr, batch, row_idx, outer_context)?;
                 evaluate_unary_op(op, &val)
             }
             Expression::Function { name, args } => {
                 let arg_values: Result<Vec<Value>> = args.iter()
-                    .map(|arg| self.evaluate(arg, batch, row_idx))
+                    .map(|arg| self.evaluate_with_context(arg, batch, row_idx, outer_context))
                     .collect();
                 evaluate_function(name, &arg_values?)
             }
             Expression::Case { operand, conditions, else_result } => {
-                evaluate_case(operand.as_deref(), conditions, else_result.as_deref(), self, batch, row_idx)
+                evaluate_case_with_context(operand.as_deref(), conditions, else_result.as_deref(), self, batch, row_idx, outer_context)
             }
             Expression::In { expr, list, not } => {
-                let expr_val = self.evaluate(expr, batch, row_idx)?;
+                let expr_val = self.evaluate_with_context(expr, batch, row_idx, outer_context)?;
                 let mut found = false;
                 for item in list {
-                    if let Ok(item_val) = self.evaluate(item, batch, row_idx) {
+                    if let Ok(item_val) = self.evaluate_with_context(item, batch, row_idx, outer_context) {
                         if expr_val == item_val {
                             found = true;
                             break;
@@ -166,12 +269,12 @@ impl ExpressionEvaluator {
                 Ok(Value::Int64(if *not { !found as i64 } else { found as i64 }))
             }
             Expression::Cast { expr, data_type } => {
-                let val = self.evaluate(expr, batch, row_idx)?;
+                let val = self.evaluate_with_context(expr, batch, row_idx, outer_context)?;
                 cast_value(&val, data_type)
             }
             Expression::NullIf { expr1, expr2 } => {
-                let val1 = self.evaluate(expr1, batch, row_idx)?;
-                let val2 = self.evaluate(expr2, batch, row_idx)?;
+                let val1 = self.evaluate_with_context(expr1, batch, row_idx, outer_context)?;
+                let val2 = self.evaluate_with_context(expr2, batch, row_idx, outer_context)?;
                 if val1 == val2 {
                     Ok(Value::Null)
                 } else {
@@ -180,7 +283,7 @@ impl ExpressionEvaluator {
             }
             Expression::Coalesce(exprs) => {
                 for expr in exprs {
-                    let val = self.evaluate(expr, batch, row_idx)?;
+                    let val = self.evaluate_with_context(expr, batch, row_idx, outer_context)?;
                     if !matches!(val, Value::Null) {
                         return Ok(val);
                     }
@@ -189,14 +292,34 @@ impl ExpressionEvaluator {
             }
             Expression::Subquery(subquery) => {
                 // Evaluate scalar subquery
-                // For now, execute the subquery and return the first row, first column
-                // TODO: Proper integration with engine for subquery execution
-                anyhow::bail!("Scalar subqueries require engine integration - not yet fully implemented")
+                if let Some(ref executor) = self.subquery_executor {
+                    // Create a single-row batch for correlated subquery context
+                    let outer_batch = outer_context.map(|b| {
+                        // Extract single row from outer context
+                        // For now, use the full batch (will be filtered in subquery)
+                        b.clone()
+                    });
+                    
+                    match executor.execute_scalar_subquery(&subquery, outer_batch.as_ref()) {
+                        Ok(Some(val)) => Ok(val),
+                        Ok(None) => Ok(Value::Null),  // Subquery returned no rows
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    anyhow::bail!("Subquery executor not provided - cannot execute scalar subquery")
+                }
             }
             Expression::Exists(subquery) => {
                 // EXISTS subquery - check if subquery returns any rows
-                // TODO: Proper integration with engine for subquery execution
-                anyhow::bail!("EXISTS subqueries require engine integration - not yet fully implemented")
+                if let Some(ref executor) = self.subquery_executor {
+                    let outer_batch = outer_context.map(|b| b.clone());
+                    match executor.execute_exists_subquery(&subquery, outer_batch.as_ref()) {
+                        Ok(exists) => Ok(Value::Int64(exists as i64)),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    anyhow::bail!("Subquery executor not provided - cannot execute EXISTS subquery")
+                }
             }
         }
     }
@@ -274,6 +397,39 @@ fn extract_value_from_array(array: &Arc<dyn Array>, idx: usize) -> Result<Value>
             let arr = array.as_any().downcast_ref::<StringArray>()
                 .ok_or_else(|| anyhow::anyhow!("Failed to downcast to StringArray"))?;
             Ok(Value::String(arr.value(idx).to_string()))
+        }
+        DataType::FixedSizeList(field, size) => {
+            // Extract vector from FixedSizeListArray
+            let list_arr = array.as_any().downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to downcast to FixedSizeListArray"))?;
+            
+            let value_array = list_arr.values();
+            let dimension = *size as usize;
+            let start_idx = idx * dimension;
+            let end_idx = start_idx + dimension;
+            
+            // Check if the value array contains Float32 or Float64
+            match field.data_type() {
+                DataType::Float32 => {
+                    let float_arr = value_array.as_any().downcast_ref::<Float32Array>()
+                        .ok_or_else(|| anyhow::anyhow!("Failed to downcast value array to Float32Array"))?;
+                    let mut vec = Vec::with_capacity(dimension);
+                    for i in start_idx..end_idx {
+                        vec.push(float_arr.value(i));
+                    }
+                    Ok(Value::Vector(vec))
+                }
+                DataType::Float64 => {
+                    let float_arr = value_array.as_any().downcast_ref::<Float64Array>()
+                        .ok_or_else(|| anyhow::anyhow!("Failed to downcast value array to Float64Array"))?;
+                    let mut vec = Vec::with_capacity(dimension);
+                    for i in start_idx..end_idx {
+                        vec.push(float_arr.value(i) as f32);
+                    }
+                    Ok(Value::Vector(vec))
+                }
+                _ => anyhow::bail!("FixedSizeListArray must contain Float32 or Float64 for vectors")
+            }
         }
         _ => anyhow::bail!("Unsupported data type: {:?}", array.data_type())
     }
@@ -355,12 +511,61 @@ fn evaluate_binary_op(op: &BinaryOperator, left: &Value, right: &Value) -> Resul
                 _ => anyhow::bail!("Invalid operands for modulo")
             }
         }
-        BinaryOperator::Eq => Ok(Value::Int64((left == right) as i64)),
-        BinaryOperator::Ne => Ok(Value::Int64((left != right) as i64)),
-        BinaryOperator::Lt => Ok(Value::Int64((left < right) as i64)),
-        BinaryOperator::Le => Ok(Value::Int64((left <= right) as i64)),
-        BinaryOperator::Gt => Ok(Value::Int64((left > right) as i64)),
-        BinaryOperator::Ge => Ok(Value::Int64((left >= right) as i64)),
+        BinaryOperator::Eq => {
+            // Handle numeric comparisons with type coercion
+            match (left, right) {
+                (Value::Int64(a), Value::Int64(b)) => Ok(Value::Int64((a == b) as i64)),
+                (Value::Float64(a), Value::Float64(b)) => Ok(Value::Int64((a == b) as i64)),
+                (Value::Int64(a), Value::Float64(b)) => Ok(Value::Int64((*a as f64 == *b) as i64)),
+                (Value::Float64(a), Value::Int64(b)) => Ok(Value::Int64((*a == *b as f64) as i64)),
+                _ => Ok(Value::Int64((left == right) as i64)),
+            }
+        }
+        BinaryOperator::Ne => {
+            match (left, right) {
+                (Value::Int64(a), Value::Int64(b)) => Ok(Value::Int64((a != b) as i64)),
+                (Value::Float64(a), Value::Float64(b)) => Ok(Value::Int64((a != b) as i64)),
+                (Value::Int64(a), Value::Float64(b)) => Ok(Value::Int64((*a as f64 != *b) as i64)),
+                (Value::Float64(a), Value::Int64(b)) => Ok(Value::Int64((*a != *b as f64) as i64)),
+                _ => Ok(Value::Int64((left != right) as i64)),
+            }
+        }
+        BinaryOperator::Lt => {
+            match (left, right) {
+                (Value::Int64(a), Value::Int64(b)) => Ok(Value::Int64((a < b) as i64)),
+                (Value::Float64(a), Value::Float64(b)) => Ok(Value::Int64((a < b) as i64)),
+                (Value::Int64(a), Value::Float64(b)) => Ok(Value::Int64(((*a as f64) < *b) as i64)),
+                (Value::Float64(a), Value::Int64(b)) => Ok(Value::Int64((*a < (*b as f64)) as i64)),
+                _ => anyhow::bail!("Cannot compare non-numeric values with <"),
+            }
+        }
+        BinaryOperator::Le => {
+            match (left, right) {
+                (Value::Int64(a), Value::Int64(b)) => Ok(Value::Int64((a <= b) as i64)),
+                (Value::Float64(a), Value::Float64(b)) => Ok(Value::Int64((a <= b) as i64)),
+                (Value::Int64(a), Value::Float64(b)) => Ok(Value::Int64(((*a as f64) <= *b) as i64)),
+                (Value::Float64(a), Value::Int64(b)) => Ok(Value::Int64((*a <= (*b as f64)) as i64)),
+                _ => anyhow::bail!("Cannot compare non-numeric values with <="),
+            }
+        }
+        BinaryOperator::Gt => {
+            match (left, right) {
+                (Value::Int64(a), Value::Int64(b)) => Ok(Value::Int64((a > b) as i64)),
+                (Value::Float64(a), Value::Float64(b)) => Ok(Value::Int64((a > b) as i64)),
+                (Value::Int64(a), Value::Float64(b)) => Ok(Value::Int64(((*a as f64) > *b) as i64)),
+                (Value::Float64(a), Value::Int64(b)) => Ok(Value::Int64((*a > (*b as f64)) as i64)),
+                _ => anyhow::bail!("Cannot compare non-numeric values with >"),
+            }
+        }
+        BinaryOperator::Ge => {
+            match (left, right) {
+                (Value::Int64(a), Value::Int64(b)) => Ok(Value::Int64((a >= b) as i64)),
+                (Value::Float64(a), Value::Float64(b)) => Ok(Value::Int64((a >= b) as i64)),
+                (Value::Int64(a), Value::Float64(b)) => Ok(Value::Int64(((*a as f64) >= *b) as i64)),
+                (Value::Float64(a), Value::Int64(b)) => Ok(Value::Int64((*a >= (*b as f64)) as i64)),
+                _ => anyhow::bail!("Cannot compare non-numeric values with >="),
+            }
+        }
         BinaryOperator::And => {
             let left_bool = match left {
                 Value::Int64(0) | Value::Null => false,
@@ -714,6 +919,50 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             Ok(args[0].clone())
         }
         
+        // Vector functions
+        "VECTOR_SIMILARITY" => {
+            if args.len() != 2 {
+                anyhow::bail!("VECTOR_SIMILARITY requires exactly 2 arguments");
+            }
+            let vec1 = match &args[0] {
+                Value::Vector(v) => v,
+                _ => anyhow::bail!("VECTOR_SIMILARITY first argument must be a vector")
+            };
+            let vec2 = match &args[1] {
+                Value::Vector(v) => v,
+                _ => anyhow::bail!("VECTOR_SIMILARITY second argument must be a vector")
+            };
+            
+            if vec1.len() != vec2.len() {
+                anyhow::bail!("Vectors must have the same dimension for VECTOR_SIMILARITY");
+            }
+            
+            // Calculate cosine similarity
+            let similarity = crate::storage::vector_index::cosine_similarity_impl(vec1, vec2);
+            Ok(Value::Float64(similarity as f64))
+        }
+        "VECTOR_DISTANCE" => {
+            if args.len() != 2 {
+                anyhow::bail!("VECTOR_DISTANCE requires exactly 2 arguments");
+            }
+            let vec1 = match &args[0] {
+                Value::Vector(v) => v,
+                _ => anyhow::bail!("VECTOR_DISTANCE first argument must be a vector")
+            };
+            let vec2 = match &args[1] {
+                Value::Vector(v) => v,
+                _ => anyhow::bail!("VECTOR_DISTANCE second argument must be a vector")
+            };
+            
+            if vec1.len() != vec2.len() {
+                anyhow::bail!("Vectors must have the same dimension for VECTOR_DISTANCE");
+            }
+            
+            // Calculate L2 (Euclidean) distance
+            let distance = crate::storage::vector_index::l2_distance_impl(vec1, vec2);
+            Ok(Value::Float64(distance as f64))
+        }
+        
         _ => anyhow::bail!("Unknown function: {}", name)
     }
 }
@@ -726,32 +975,81 @@ fn evaluate_case(
     batch: &ExecutionBatch,
     row_idx: usize,
 ) -> Result<Value> {
+    evaluate_case_with_context(operand, conditions, else_result, evaluator, batch, row_idx, Some(batch))
+}
+
+fn evaluate_case_with_context(
+    operand: Option<&Expression>,
+    conditions: &[(Expression, Expression)],
+    else_result: Option<&Expression>,
+    evaluator: &ExpressionEvaluator,
+    batch: &ExecutionBatch,
+    row_idx: usize,
+    outer_context: Option<&ExecutionBatch>,
+) -> Result<Value> {
     for (condition, result) in conditions {
         let condition_val = if let Some(op) = operand {
             // CASE expr WHEN val1 THEN ... WHEN val2 THEN ...
-            let op_val = evaluator.evaluate(op, batch, row_idx)?;
-            let cond_val = evaluator.evaluate(condition, batch, row_idx)?;
+            let op_val = evaluator.evaluate_with_context(op, batch, row_idx, outer_context)?;
+            let cond_val = evaluator.evaluate_with_context(condition, batch, row_idx, outer_context)?;
             op_val == cond_val
         } else {
             // CASE WHEN condition1 THEN ... WHEN condition2 THEN ...
-            let cond_val = evaluator.evaluate(condition, batch, row_idx)?;
+            let cond_val = evaluator.evaluate_with_context(condition, batch, row_idx, outer_context)?;
             matches!(cond_val, Value::Int64(1) | Value::Int64(-1)) || !matches!(cond_val, Value::Int64(0) | Value::Null)
         };
         
         if condition_val {
-            return evaluator.evaluate(result, batch, row_idx);
+            return evaluator.evaluate_with_context(result, batch, row_idx, outer_context);
         }
     }
     
     if let Some(else_expr) = else_result {
-        evaluator.evaluate(else_expr, batch, row_idx)
+        evaluator.evaluate_with_context(else_expr, batch, row_idx, outer_context)
     } else {
         Ok(Value::Null)
     }
 }
 
-fn cast_value(val: &Value, target_type: &DataType) -> Result<Value> {
+pub fn cast_value(val: &Value, target_type: &DataType) -> Result<Value> {
     match target_type {
+        // Integer types
+        DataType::Int8 => {
+            match val {
+                Value::Int64(i) => Ok(Value::Int32(*i as i32)),
+                Value::Int32(i) => Ok(Value::Int32(*i)),
+                Value::Float64(f) => Ok(Value::Int32(*f as i32)),
+                Value::Float32(f) => Ok(Value::Int32(*f as i32)),
+                Value::String(s) => Ok(Value::Int32(s.parse::<i32>().unwrap_or(0))),
+                Value::Bool(b) => Ok(Value::Int32(if *b { 1 } else { 0 })),
+                Value::Vector(_) => Ok(Value::Null), // Cannot cast vector to integer
+                Value::Null => Ok(Value::Null),
+            }
+        }
+        DataType::Int16 => {
+            match val {
+                Value::Int64(i) => Ok(Value::Int32(*i as i32)),
+                Value::Int32(i) => Ok(Value::Int32(*i)),
+                Value::Float64(f) => Ok(Value::Int32(*f as i32)),
+                Value::Float32(f) => Ok(Value::Int32(*f as i32)),
+                Value::String(s) => Ok(Value::Int32(s.parse::<i32>().unwrap_or(0))),
+                Value::Bool(b) => Ok(Value::Int32(if *b { 1 } else { 0 })),
+                Value::Vector(_) => Ok(Value::Null), // Cannot cast vector to integer
+                Value::Null => Ok(Value::Null),
+            }
+        }
+        DataType::Int32 => {
+            match val {
+                Value::Int64(i) => Ok(Value::Int32(*i as i32)),
+                Value::Int32(i) => Ok(Value::Int32(*i)),
+                Value::Float64(f) => Ok(Value::Int32(*f as i32)),
+                Value::Float32(f) => Ok(Value::Int32(*f as i32)),
+                Value::String(s) => Ok(Value::Int32(s.parse().unwrap_or(0))),
+                Value::Bool(b) => Ok(Value::Int32(if *b { 1 } else { 0 })),
+                Value::Vector(_) => Ok(Value::Null), // Cannot cast vector to integer
+                Value::Null => Ok(Value::Null),
+            }
+        }
         DataType::Int64 => {
             match val {
                 Value::Int64(i) => Ok(Value::Int64(*i)),
@@ -760,6 +1058,33 @@ fn cast_value(val: &Value, target_type: &DataType) -> Result<Value> {
                 Value::Float32(f) => Ok(Value::Int64(*f as i64)),
                 Value::String(s) => Ok(Value::Int64(s.parse().unwrap_or(0))),
                 Value::Bool(b) => Ok(Value::Int64(if *b { 1 } else { 0 })),
+                Value::Vector(_) => Ok(Value::Null), // Cannot cast vector to integer
+                Value::Null => Ok(Value::Null),
+            }
+        }
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+            // Unsigned integers - convert to signed Int64 (best we can do with Value enum)
+            match val {
+                Value::Int64(i) => Ok(Value::Int64(*i.max(&0))),
+                Value::Int32(i) => Ok(Value::Int64((*i as i64).max(0))),
+                Value::Float64(f) => Ok(Value::Int64((*f as i64).max(0))),
+                Value::Float32(f) => Ok(Value::Int64((*f as i64).max(0))),
+                Value::String(s) => Ok(Value::Int64(s.parse::<i64>().unwrap_or(0).max(0))),
+                Value::Bool(b) => Ok(Value::Int64(if *b { 1 } else { 0 })),
+                Value::Vector(_) => Ok(Value::Null), // Cannot cast vector to integer
+                Value::Null => Ok(Value::Null),
+            }
+        }
+        // Floating point types
+        DataType::Float32 => {
+            match val {
+                Value::Int64(i) => Ok(Value::Float32(*i as f32)),
+                Value::Int32(i) => Ok(Value::Float32(*i as f32)),
+                Value::Float64(f) => Ok(Value::Float32(*f as f32)),
+                Value::Float32(f) => Ok(Value::Float32(*f)),
+                Value::String(s) => Ok(Value::Float32(s.parse().unwrap_or(0.0))),
+                Value::Bool(b) => Ok(Value::Float32(if *b { 1.0 } else { 0.0 })),
+                Value::Vector(_) => Ok(Value::Null), // Cannot cast vector to float
                 Value::Null => Ok(Value::Null),
             }
         }
@@ -771,13 +1096,57 @@ fn cast_value(val: &Value, target_type: &DataType) -> Result<Value> {
                 Value::Float32(f) => Ok(Value::Float64(*f as f64)),
                 Value::String(s) => Ok(Value::Float64(s.parse().unwrap_or(0.0))),
                 Value::Bool(b) => Ok(Value::Float64(if *b { 1.0 } else { 0.0 })),
+                Value::Vector(_) => Ok(Value::Null), // Cannot cast vector to float
                 Value::Null => Ok(Value::Null),
             }
         }
-        DataType::Utf8 => {
+        // String types
+        DataType::Utf8 | DataType::LargeUtf8 => {
             Ok(Value::String(format!("{}", val)))
         }
-        _ => anyhow::bail!("Unsupported cast to type: {:?}", target_type)
+        // Boolean
+        DataType::Boolean => {
+            match val {
+                Value::Int64(i) => Ok(Value::Bool(*i != 0)),
+                Value::Int32(i) => Ok(Value::Bool(*i != 0)),
+                Value::Float64(f) => Ok(Value::Bool(*f != 0.0)),
+                Value::Float32(f) => Ok(Value::Bool(*f != 0.0)),
+                Value::String(s) => {
+                    let s_lower = s.to_lowercase();
+                    Ok(Value::Bool(s_lower == "true" || s_lower == "1" || s_lower == "yes" || s_lower == "t"))
+                }
+                Value::Bool(b) => Ok(Value::Bool(*b)),
+                Value::Vector(_) => Ok(Value::Bool(true)), // Non-empty vector is truthy
+                Value::Null => Ok(Value::Null),
+            }
+        }
+        // Date/Time types - convert to string representation
+        DataType::Date32 | DataType::Date64 | 
+        DataType::Timestamp(_, _) | DataType::Time32(_) | DataType::Time64(_) |
+        DataType::Duration(_) | DataType::Interval(_) => {
+            Ok(Value::String(format!("{}", val)))
+        }
+        // Decimal types - convert to Float64
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
+            match val {
+                Value::Int64(i) => Ok(Value::Float64(*i as f64)),
+                Value::Int32(i) => Ok(Value::Float64(*i as f64)),
+                Value::Float64(f) => Ok(Value::Float64(*f)),
+                Value::Float32(f) => Ok(Value::Float64(*f as f64)),
+                Value::String(s) => Ok(Value::Float64(s.parse().unwrap_or(0.0))),
+                Value::Bool(b) => Ok(Value::Float64(if *b { 1.0 } else { 0.0 })),
+                Value::Vector(_) => Ok(Value::Null), // Cannot cast vector to decimal
+                Value::Null => Ok(Value::Null),
+            }
+        }
+        // Binary types - convert to string
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
+            Ok(Value::String(format!("{:?}", val)))
+        }
+        // Other types - convert to string
+        _ => {
+            Ok(Value::String(format!("{}", val)))
+        }
     }
 }
 

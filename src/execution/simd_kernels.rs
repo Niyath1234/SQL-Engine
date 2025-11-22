@@ -24,63 +24,93 @@ pub fn filter_simd_i64(
     
     match predicate {
         FilterPredicate::Equals(value) => {
-            if let Value::Int64(target) = value {
-                // Process in chunks (compiler will vectorize)
-                let chunks = data.chunks_exact(SIMD_LANES);
-                let remainder = chunks.remainder();
-                let mut idx = 0;
-                
-                for chunk in chunks {
-                    // Process chunk - compiler will auto-vectorize
-                    for &val in chunk {
-                        result[idx] = val == target;
-                        idx += 1;
-                    }
-                }
-                
-                // Handle remainder
-                for &val in remainder {
+            let target = extract_i64(&value); // Handle both Int64 and Float64
+            let chunks = data.chunks_exact(SIMD_LANES);
+            let remainder = chunks.remainder();
+            let mut idx = 0;
+            
+            for chunk in chunks {
+                for &val in chunk {
                     result[idx] = val == target;
                     idx += 1;
                 }
             }
+            
+            for &val in remainder {
+                result[idx] = val == target;
+                idx += 1;
+            }
         }
         FilterPredicate::GreaterThan(value) => {
-            if let Value::Int64(target) = value {
-                let chunks = data.chunks_exact(SIMD_LANES);
-                let remainder = chunks.remainder();
-                let mut idx = 0;
-                
-                for chunk in chunks {
-                    for &val in chunk {
-                        result[idx] = val > target;
-                        idx += 1;
-                    }
-                }
-                
-                for &val in remainder {
+            let target = extract_i64(&value); // Handle both Int64 and Float64
+            let chunks = data.chunks_exact(SIMD_LANES);
+            let remainder = chunks.remainder();
+            let mut idx = 0;
+            
+            for chunk in chunks {
+                for &val in chunk {
                     result[idx] = val > target;
                     idx += 1;
                 }
             }
+            
+            for &val in remainder {
+                result[idx] = val > target;
+                idx += 1;
+            }
         }
         FilterPredicate::LessThan(value) => {
-            if let Value::Int64(target) = value {
-                let chunks = data.chunks_exact(SIMD_LANES);
-                let remainder = chunks.remainder();
-                let mut idx = 0;
-                
-                for chunk in chunks {
-                    for &val in chunk {
-                        result[idx] = val < target;
-                        idx += 1;
-                    }
-                }
-                
-                for &val in remainder {
+            let target = extract_i64(&value); // Handle both Int64 and Float64
+            let chunks = data.chunks_exact(SIMD_LANES);
+            let remainder = chunks.remainder();
+            let mut idx = 0;
+            
+            for chunk in chunks {
+                for &val in chunk {
                     result[idx] = val < target;
                     idx += 1;
                 }
+            }
+            
+            for &val in remainder {
+                result[idx] = val < target;
+                idx += 1;
+            }
+        }
+        FilterPredicate::GreaterThanOrEqual(value) => {
+            let target = extract_i64(&value); // Handle both Int64 and Float64
+            let chunks = data.chunks_exact(SIMD_LANES);
+            let remainder = chunks.remainder();
+            let mut idx = 0;
+            
+            for chunk in chunks {
+                for &val in chunk {
+                    result[idx] = val >= target;
+                    idx += 1;
+                }
+            }
+            
+            for &val in remainder {
+                result[idx] = val >= target;
+                idx += 1;
+            }
+        }
+        FilterPredicate::LessThanOrEqual(value) => {
+            let target = extract_i64(&value); // Handle both Int64 and Float64
+            let chunks = data.chunks_exact(SIMD_LANES);
+            let remainder = chunks.remainder();
+            let mut idx = 0;
+            
+            for chunk in chunks {
+                for &val in chunk {
+                    result[idx] = val <= target;
+                    idx += 1;
+                }
+            }
+            
+            for &val in remainder {
+                result[idx] = val <= target;
+                idx += 1;
             }
         }
         _ => {
@@ -90,6 +120,8 @@ pub fn filter_simd_i64(
                     FilterPredicate::Equals(v) => val == extract_i64(v),
                     FilterPredicate::GreaterThan(v) => val > extract_i64(v),
                     FilterPredicate::LessThan(v) => val < extract_i64(v),
+                    FilterPredicate::GreaterThanOrEqual(v) => val >= extract_i64(v),
+                    FilterPredicate::LessThanOrEqual(v) => val <= extract_i64(v),
                     _ => false,
                 };
             }
@@ -108,60 +140,93 @@ pub fn filter_simd_f64(
     
     match predicate {
         FilterPredicate::Equals(value) => {
-            if let Value::Float64(target) = value {
-                let chunks = data.chunks_exact(SIMD_LANES);
-                let remainder = chunks.remainder();
-                let mut idx = 0;
-                
-                for chunk in chunks {
-                    for &val in chunk {
-                        result[idx] = val == target;
-                        idx += 1;
-                    }
-                }
-                
-                for &val in remainder {
+            let target = extract_f64(&value); // Handle both Int64 and Float64
+            let chunks = data.chunks_exact(SIMD_LANES);
+            let remainder = chunks.remainder();
+            let mut idx = 0;
+            
+            for chunk in chunks {
+                for &val in chunk {
                     result[idx] = val == target;
                     idx += 1;
                 }
             }
+            
+            for &val in remainder {
+                result[idx] = val == target;
+                idx += 1;
+            }
         }
         FilterPredicate::GreaterThan(value) => {
-            if let Value::Float64(target) = value {
-                let chunks = data.chunks_exact(SIMD_LANES);
-                let remainder = chunks.remainder();
-                let mut idx = 0;
-                
-                for chunk in chunks {
-                    for &val in chunk {
-                        result[idx] = val > target;
-                        idx += 1;
-                    }
-                }
-                
-                for &val in remainder {
+            let target = extract_f64(&value); // Handle both Int64 and Float64
+            let chunks = data.chunks_exact(SIMD_LANES);
+            let remainder = chunks.remainder();
+            let mut idx = 0;
+            
+            for chunk in chunks {
+                for &val in chunk {
                     result[idx] = val > target;
                     idx += 1;
                 }
             }
+            
+            for &val in remainder {
+                result[idx] = val > target;
+                idx += 1;
+            }
         }
         FilterPredicate::LessThan(value) => {
-            if let Value::Float64(target) = value {
-                let chunks = data.chunks_exact(SIMD_LANES);
-                let remainder = chunks.remainder();
-                let mut idx = 0;
-                
-                for chunk in chunks {
-                    for &val in chunk {
-                        result[idx] = val < target;
-                        idx += 1;
-                    }
-                }
-                
-                for &val in remainder {
+            let target = extract_f64(&value); // Handle both Int64 and Float64
+            let chunks = data.chunks_exact(SIMD_LANES);
+            let remainder = chunks.remainder();
+            let mut idx = 0;
+            
+            for chunk in chunks {
+                for &val in chunk {
                     result[idx] = val < target;
                     idx += 1;
                 }
+            }
+            
+            for &val in remainder {
+                result[idx] = val < target;
+                idx += 1;
+            }
+        }
+        FilterPredicate::GreaterThanOrEqual(value) => {
+            let target = extract_f64(&value); // Handle both Int64 and Float64
+            let chunks = data.chunks_exact(SIMD_LANES);
+            let remainder = chunks.remainder();
+            let mut idx = 0;
+            
+            for chunk in chunks {
+                for &val in chunk {
+                    result[idx] = val >= target;
+                    idx += 1;
+                }
+            }
+            
+            for &val in remainder {
+                result[idx] = val >= target;
+                idx += 1;
+            }
+        }
+        FilterPredicate::LessThanOrEqual(value) => {
+            let target = extract_f64(&value); // Handle both Int64 and Float64
+            let chunks = data.chunks_exact(SIMD_LANES);
+            let remainder = chunks.remainder();
+            let mut idx = 0;
+            
+            for chunk in chunks {
+                for &val in chunk {
+                    result[idx] = val <= target;
+                    idx += 1;
+                }
+            }
+            
+            for &val in remainder {
+                result[idx] = val <= target;
+                idx += 1;
             }
         }
         _ => {
@@ -171,6 +236,8 @@ pub fn filter_simd_f64(
                     FilterPredicate::Equals(v) => val == extract_f64(v),
                     FilterPredicate::GreaterThan(v) => val > extract_f64(v),
                     FilterPredicate::LessThan(v) => val < extract_f64(v),
+                    FilterPredicate::GreaterThanOrEqual(v) => val >= extract_f64(v),
+                    FilterPredicate::LessThanOrEqual(v) => val <= extract_f64(v),
                     _ => false,
                 };
             }
@@ -221,6 +288,8 @@ fn extract_i64(v: &crate::storage::fragment::Value) -> i64 {
     match v {
         crate::storage::fragment::Value::Int64(x) => *x,
         crate::storage::fragment::Value::Int32(x) => *x as i64,
+        crate::storage::fragment::Value::Float64(x) => *x as i64, // Cross-type: convert float to int
+        crate::storage::fragment::Value::Float32(x) => *x as i64,
         _ => 0,
     }
 }
@@ -230,6 +299,8 @@ fn extract_f64(v: &crate::storage::fragment::Value) -> f64 {
     match v {
         crate::storage::fragment::Value::Float64(x) => *x,
         crate::storage::fragment::Value::Float32(x) => *x as f64,
+        crate::storage::fragment::Value::Int64(x) => *x as f64, // Cross-type: convert int to float
+        crate::storage::fragment::Value::Int32(x) => *x as f64,
         _ => 0.0,
     }
 }

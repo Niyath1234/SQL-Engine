@@ -2,9 +2,7 @@
 /// Handles WITH clauses and recursive CTEs
 use sqlparser::ast::*;
 use crate::query::plan::*;
-use crate::query::parser::ParsedQuery;
 use crate::hypergraph::graph::HyperGraph;
-use crate::hypergraph::node::NodeId;
 use anyhow::Result;
 use std::sync::Arc;
 use std::collections::HashMap;

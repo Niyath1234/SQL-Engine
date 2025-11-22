@@ -1,8 +1,10 @@
 use crate::storage::columnar::ColumnarBatch;
+use crate::storage::fragment::ColumnFragment;
 use arrow::array::*;
 use arrow::datatypes::*;
 use std::sync::Arc;
 use bitvec::prelude::*;
+use std::collections::HashMap;
 
 /// Execution batch - optimized batch for execution pipeline
 /// Uses SIMD-friendly layouts and zero-copy where possible
@@ -16,6 +18,10 @@ pub struct ExecutionBatch {
     
     /// Row count (after selection)
     pub row_count: usize,
+    
+    /// Column fragments metadata (for dictionary encoding lookup)
+    /// Maps column name -> fragment (optional, only for dictionary-encoded columns)
+    pub column_fragments: HashMap<String, Arc<ColumnFragment>>,
 }
 
 impl ExecutionBatch {
@@ -27,6 +33,20 @@ impl ExecutionBatch {
             batch,
             selection,
             row_count,
+            column_fragments: HashMap::new(),
+        }
+    }
+    
+    /// Create batch with column fragment metadata (for dictionary encoding)
+    pub fn with_fragments(batch: ColumnarBatch, column_fragments: HashMap<String, Arc<ColumnFragment>>) -> Self {
+        let row_count = batch.row_count;
+        let selection = bitvec![1; row_count];
+        
+        Self {
+            batch,
+            selection,
+            row_count,
+            column_fragments,
         }
     }
     
@@ -58,7 +78,13 @@ impl ExecutionBatch {
             batch,
             selection: new_selection,
             row_count,
+            column_fragments: self.column_fragments.clone(), // Fragments are shared
         }
+    }
+    
+    /// Get fragment for a column (for dictionary encoding lookup)
+    pub fn get_column_fragment(&self, column_name: &str) -> Option<&Arc<ColumnFragment>> {
+        self.column_fragments.get(column_name)
     }
 }
 

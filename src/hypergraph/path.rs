@@ -135,6 +135,35 @@ impl PathCache {
         }
     }
     
+    /// Clean up old/unused paths (periodic maintenance)
+    /// Removes paths that haven't been used in a long time, even if cache isn't full
+    pub fn cleanup_expired(&mut self, max_age_seconds: u64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        // Collect expired paths (haven't been used in max_age_seconds)
+        let expired_keys: Vec<PathSignature> = self.paths
+            .iter()
+            .filter(|(_, path)| {
+                let age = now.saturating_sub(path.last_used);
+                age > max_age_seconds
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        
+        // Remove expired paths
+        for key in expired_keys {
+            self.paths.remove(&key);
+        }
+    }
+    
+    /// Get cache size
+    pub fn len(&self) -> usize {
+        self.paths.len()
+    }
+    
     /// Find similar paths (for reuse)
     pub fn find_similar(&self, target: &PathSignature) -> Vec<&HyperPath> {
         self.paths

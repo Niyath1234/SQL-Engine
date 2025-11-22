@@ -1,7 +1,7 @@
 /// Tiered indexes as memory filters
 /// Multi-level indexes that act as filters to skip irrelevant data
 use crate::storage::fragment::{ColumnFragment, Value};
-use crate::storage::learned_index::{RecursiveModelIndex, HashLearnedIndex, LearnedIndex};
+use crate::storage::learned_index::{RecursiveModelIndex, LearnedIndex};
 use crate::storage::index::{SortedIndex, HashIndex, BloomIndex, BTreeIndex, ColumnIndex};
 use crate::hypergraph::node::NodeId;
 use arrow::array::*;

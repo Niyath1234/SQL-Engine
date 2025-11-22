@@ -2,7 +2,6 @@
 /// Avoids materializing repeated substructures
 use crate::storage::fragment::Value;
 use std::collections::HashMap;
-use std::hash::Hash;
 
 /// Factorized representation of query results
 /// Instead of flat tuples, stores nested structures

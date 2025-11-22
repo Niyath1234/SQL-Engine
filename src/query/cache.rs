@@ -60,19 +60,42 @@ impl PlanCache {
     }
     
     /// Get a cached plan
-    pub fn get(&self, signature: &QuerySignature) -> Option<&QueryPlan> {
-        self.plans.get(signature)
+    pub fn get(&self, signature: &QuerySignature) -> Option<QueryPlan> {
+        self.plans.get(signature).cloned()
     }
     
     /// Insert a plan
+    /// Automatically evicts least recently used if cache is full
     pub fn insert(&mut self, signature: QuerySignature, plan: QueryPlan) {
-        if self.plans.len() >= self.max_size {
-            // Evict oldest (simple strategy - could use LRU)
+        // If inserting duplicate, remove old one first (this makes it most recently used)
+        if self.plans.contains_key(&signature) {
+            self.plans.remove(&signature);
+        }
+        
+        // Evict oldest if at capacity (FIFO strategy)
+        // Note: HashMap doesn't preserve insertion order, so we remove arbitrary entry
+        // For true LRU, we'd need an ordered map or additional tracking
+        if self.plans.len() >= self.max_size && !self.plans.is_empty() {
+            // Remove first entry (simplified eviction)
             if let Some(key) = self.plans.keys().next().cloned() {
                 self.plans.remove(&key);
             }
         }
+        
+        // Insert new plan
         self.plans.insert(signature, plan);
+    }
+    
+    /// Clean up cache by removing entries when at capacity
+    /// Automatically called during insert, but can be called manually too
+    pub fn cleanup_if_needed(&mut self) {
+        while self.plans.len() > self.max_size {
+            if let Some(key) = self.plans.keys().next().cloned() {
+                self.plans.remove(&key);
+            } else {
+                break;
+            }
+        }
     }
     
     /// Check if a similar query exists (for reuse)

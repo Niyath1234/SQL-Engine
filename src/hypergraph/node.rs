@@ -103,7 +103,12 @@ impl HyperNode {
     
     /// Update statistics from fragments
     pub fn update_stats(&mut self) {
-        self.stats.row_count = self.fragments.iter().map(|f| f.len()).sum();
+        // For table nodes, all column fragments should have the same row_count
+        // So we use the first fragment's row_count (or 0 if no fragments)
+        // For column nodes, there's typically one fragment, so this works correctly
+        self.stats.row_count = self.fragments.first()
+            .map(|f| f.len())
+            .unwrap_or(0);
         self.stats.size_bytes = self.fragments.iter().map(|f| f.metadata.memory_size).sum();
         // TODO: Update cardinality estimate
     }

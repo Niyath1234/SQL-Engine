@@ -199,8 +199,10 @@ impl LearnedIndex for RecursiveModelIndex {
     fn predict_position(&self, value: &Value) -> usize {
         let numeric_value = match value {
             Value::Int64(v) => *v as f64,
+            Value::Int32(v) => *v as f64,
             Value::Float64(v) => *v,
-            _ => return 0,
+            Value::Float32(v) => *v as f64,
+            Value::Vector(_) | Value::String(_) | Value::Bool(_) | Value::Null => return 0,
         };
         
         let predicted = self.root_model.predict(numeric_value);
@@ -277,6 +279,7 @@ impl RecursiveModelIndex {
                 OrderedFloat(*x) == OrderedFloat(*y)
             }
             (Value::String(x), Value::String(y)) => x == y,
+            (Value::Vector(x), Value::Vector(y)) => x == y,
             (Value::Null, Value::Null) => true,
             _ => false,
         }

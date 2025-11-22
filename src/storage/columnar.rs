@@ -19,6 +19,41 @@ pub struct ColumnarBatch {
 impl ColumnarBatch {
     pub fn new(columns: Vec<Arc<dyn Array>>, schema: SchemaRef) -> Self {
         let row_count = columns.first().map(|c| c.len()).unwrap_or(0);
+        
+        // PHASE 4: Validate that array types match schema types (dtype-aware validation)
+        // This catches type mismatches early
+        #[cfg(debug_assertions)]
+        {
+            let schema_fields = schema.fields();
+            if columns.len() != schema_fields.len() {
+                eprintln!("  WARNING: Column count ({}) != schema field count ({})", 
+                    columns.len(), schema_fields.len());
+            }
+            
+            // Check for duplicate field names in schema
+            let field_names: Vec<String> = schema_fields.iter().map(|f| f.name().to_string()).collect();
+            let unique_names: std::collections::HashSet<String> = field_names.iter().cloned().collect();
+            if field_names.len() != unique_names.len() {
+                eprintln!(" ERROR: ColumnarBatch schema has duplicate field names: {:?}", field_names);
+                // Find duplicates
+                let mut seen = std::collections::HashSet::new();
+                let duplicates: Vec<String> = field_names.iter()
+                    .filter(|name| !seen.insert(name.clone()))
+                    .cloned()
+                    .collect();
+                eprintln!(" ERROR: Duplicate field names: {:?}", duplicates);
+            }
+            
+            for (i, (col, field)) in columns.iter().zip(schema_fields.iter()).enumerate() {
+                let actual_type = col.data_type();
+                let expected_type = field.data_type();
+                if actual_type != expected_type {
+                    eprintln!("  WARNING: Type mismatch for field '{}' (index {}): expected {:?}, got {:?}", 
+                        field.name(), i, expected_type, actual_type);
+                }
+            }
+        }
+        
         Self {
             columns,
             schema,
