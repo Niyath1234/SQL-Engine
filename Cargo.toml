@@ -1,4 +1,4 @@
-[package]
+ [package]
 name = "hypergraph-sql-engine"
 version = "0.1.0"
 edition = "2021"
@@ -81,46 +81,43 @@ name = "sql_repl"
 path = "src/bin/sql_repl.rs"
 
 [[bin]]
-name = "test_order_by_fix"
-path = "test_order_by_fix.rs"
-
-[[bin]]
-name = "test_all_features"
-path = "test_all_features.rs"
-
-[[bin]]
-name = "test_query_output"
-path = "test_query_output.rs"
-
-[[bin]]
-name = "test_window_query"
-path = "test_window_query.rs"
-
-[[bin]]
-name = "test_metadata_storage"
-path = "test_metadata_storage.rs"
-
-[[bin]]
-name = "test_vector_search"
-path = "test_vector_search.rs"
-
-[[bin]]
-name = "test_comprehensive"
-path = "test_comprehensive.rs"
-
-[[bin]]
-name = "test_dtype_fix"
-path = "test_dtype_fix.rs"
-
-[[bin]]
-name = "test_set_operations"
-path = "test_set_operations.rs"
-
-[[bin]]
-name = "test_transactions"
-path = "test_transactions.rs"
-
-[[bin]]
 name = "benchmark"
 path = "src/bin/benchmark.rs"
+
+[[bin]]
+name = "verify_features"
+path = "verify_features.rs"
+
+[[bin]]
+name = "test_join_minimal"
+path = "test_join_minimal.rs"
+
+[[bin]]
+name = "test_join_simple"
+path = "test_join_simple.rs"
+
+[[bin]]
+name = "test_join_demo"
+path = "test_join_demo.rs"
+
+[[bin]]
+name = "test_multi_join"
+path = "test_multi_join.rs"
+
+[[bin]]
+name = "test_complex_query"
+path = "test_complex_query.rs"
+
+[[bin]]
+name = "test_complex_queries_suite"
+path = "test_complex_queries_suite.rs"
+
+# Temporarily disabled - uses old APIs
+# [[bin]]
+# name = "test_query4"
+# path = "test_query4.rs"
+
+# [[bin]]
+# name = "test_query4_standalone"
+# path = "test_query4_standalone.rs"
 

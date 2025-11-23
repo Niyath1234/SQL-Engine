@@ -489,6 +489,16 @@
         .remove-column-btn:hover {
             background: #d01100;
         }
+        
+        /* Clear cache button styling */
+        .sidebar-actions button[onclick="clearCacheFiles()"] {
+            background: #5a1d1d !important;
+            color: #f48771;
+        }
+        
+        .sidebar-actions button[onclick="clearCacheFiles()"]:hover {
+            background: #6a2d2d !important;
+        }
     </style>
 </head>
 <body>
@@ -502,6 +512,7 @@
             <div class="sidebar-actions">
                 <button onclick="showLoadCsvModal()">📁 Load CSV</button>
                 <button class="secondary" onclick="showCreateTableModal()">➕ Create Table</button>
+                <button class="secondary" onclick="clearCacheFiles()" style="background: #5a1d1d;" title="Clear cache and program-created files">🗑️ Clear Cache</button>
             </div>
             <div class="sidebar-content">
                 <h2>Tables</h2>
@@ -1040,6 +1051,78 @@
                 hideCreateTableModal();
             }
         });
+        
+        // Clear cache and program files
+        async function clearCacheFiles() {
+            if (!confirm('Are you sure you want to clear all cache and program-created files?\n\nThis will remove:\n- Pattern learning database (.query_patterns/)\n- Transaction logs (.wal/)\n- Log files\n\nThis action cannot be undone!')) {
+                return;
+            }
+            
+            const resultsContent = document.getElementById('resultsContent');
+            const resultsInfo = document.getElementById('resultsInfo');
+            
+            resultsInfo.textContent = 'Clearing cache...';
+            resultsContent.innerHTML = '<div class="loading">Clearing cache and program files...</div>';
+            
+            try {
+                const response = await fetch('/api/clear_cache', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    resultsInfo.textContent = 'Cache cleared successfully';
+                    
+                    let html = '<div class="success-message"><strong>Cache Cleared Successfully!</strong></div>';
+                    html += '<div style="margin-top: 15px; padding: 12px; background: #2d2d30; border-radius: 4px;">';
+                    html += '<h4 style="margin-bottom: 8px; color: #4ec9b0;">Cleared Items:</h4>';
+                    html += '<ul style="margin-left: 20px; color: #d4d4d4;">';
+                    
+                    if (data.cleared_items && data.cleared_items.length > 0) {
+                        data.cleared_items.forEach(item => {
+                            html += `<li style="margin-bottom: 4px;">${escapeHtml(item)}</li>`;
+                        });
+                    } else {
+                        html += '<li>No cache files found to clear</li>';
+                    }
+                    
+                    html += '</ul>';
+                    html += '</div>';
+                    html += '<div style="margin-top: 15px; padding: 12px; background: #2d2d30; border-radius: 4px; color: #858585; font-size: 12px;">';
+                    html += '<strong>Note:</strong> The engine will recreate these files on the next query execution.';
+                    html += '</div>';
+                    
+                    resultsContent.innerHTML = html;
+                    
+                    // Refresh stats and tables after clearing
+                    setTimeout(() => {
+                        loadStats();
+                        loadTables();
+                    }, 1000);
+                } else {
+                    resultsInfo.textContent = 'Error clearing cache';
+                    let html = '<div class="error-message"><strong>Error:</strong> ' + escapeHtml(data.error || data.message || 'Unknown error') + '</div>';
+                    if (data.cleared_items && data.cleared_items.length > 0) {
+                        html += '<div style="margin-top: 15px; padding: 12px; background: #2d2d30; border-radius: 4px;">';
+                        html += '<h4 style="margin-bottom: 8px; color: #f48771;">Partially Cleared:</h4>';
+                        html += '<ul style="margin-left: 20px; color: #d4d4d4;">';
+                        data.cleared_items.forEach(item => {
+                            html += `<li style="margin-bottom: 4px;">${escapeHtml(item)}</li>`;
+                        });
+                        html += '</ul></div>';
+                    }
+                    resultsContent.innerHTML = html;
+                }
+            } catch (error) {
+                resultsInfo.textContent = 'Error';
+                resultsContent.innerHTML = 
+                    `<div class="error-message"><strong>Network Error:</strong> ${escapeHtml(error.message)}</div>`;
+            }
+        }
         
         // Initialize
         initCreateTableModal();

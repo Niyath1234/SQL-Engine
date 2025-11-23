@@ -411,32 +411,53 @@ impl QueryPlanner {
             let normalized_table = table.trim_matches('"').trim_matches('\'').to_lowercase();
             tracing::debug!("Normalized table name: '{}'", normalized_table);
             
-            // Use O(1) lookup via table_index
-            if let Some(table_node) = self.graph.get_table_node(&normalized_table) {
-                nodes.push(table_node.id);
-                tracing::debug!("Found table node: {:?}", table_node.id);
+            // EDGE CASE 2 FIX: Check CTE context FIRST before hypergraph lookup
+            // This allows nested CTEs to reference earlier CTEs during materialization
+            let is_cte = if let Some(ref cte_ctx) = self.cte_context {
+                cte_ctx.contains(&normalized_table)
             } else {
-                // Fallback: try case-insensitive lookup
-                let mut found = false;
-                for entry in self.graph.table_index.iter() {
-                    let (table_name, node_id) = (entry.key(), entry.value());
-                    if table_name.to_lowercase() == normalized_table {
-                        if let Some(node) = self.graph.get_node(*node_id) {
-                            nodes.push(node.id);
-                            found = true;
-                            tracing::debug!("Found table node (case-insensitive): {:?}", node.id);
-                            break;
+                false
+            };
+            
+            if is_cte {
+                tracing::debug!("Table '{}' is a CTE, will be handled by CTEScan operator", normalized_table);
+                // Don't add to nodes - CTEScan will handle it
+            } else {
+                // Use O(1) lookup via table_index
+                if let Some(table_node) = self.graph.get_table_node(&normalized_table) {
+                    nodes.push(table_node.id);
+                    tracing::debug!("Found table node: {:?}", table_node.id);
+                } else {
+                    // Fallback: try case-insensitive lookup
+                    let mut found = false;
+                    for entry in self.graph.table_index.iter() {
+                        let (table_name, node_id) = (entry.key(), entry.value());
+                        if table_name.to_lowercase() == normalized_table {
+                            if let Some(node) = self.graph.get_node(*node_id) {
+                                nodes.push(node.id);
+                                found = true;
+                                tracing::debug!("Found table node (case-insensitive): {:?}", node.id);
+                                break;
+                            }
                         }
                     }
-                }
-                
-                if !found {
-                    // Collect available tables for error message
-                    let mut all_table_names = Vec::new();
-                    for entry in self.graph.table_index.iter() {
-                        all_table_names.push(entry.key().clone());
+                    
+                    if !found {
+                        // EDGE CASE 2 FIX: Check if this is a CTE before failing
+                        if let Some(ref cte_ctx) = self.cte_context {
+                            if cte_ctx.contains(&normalized_table) {
+                                tracing::debug!("Table '{}' is a CTE, will be handled by CTEScan operator", normalized_table);
+                                // Don't add to nodes - CTEScan will handle it
+                                continue;
+                            }
+                        }
+                        // Collect available tables for error message
+                        let mut all_table_names = Vec::new();
+                        for entry in self.graph.table_index.iter() {
+                            all_table_names.push(entry.key().clone());
+                        }
+                        anyhow::bail!("Table '{}' not found in hypergraph and is not a CTE. Available tables: {:?}", table, all_table_names);
                     }
-                    anyhow::bail!("Table '{}' not found in hypergraph. Available tables: {:?}", table, all_table_names);
                 }
             }
         }
@@ -589,7 +610,11 @@ impl QueryPlanner {
         };
         
         // Add joins
-        for (i, edge_id) in join_path.iter().enumerate() {
+        // CRITICAL FIX: Create JOIN operators even if join_path is empty (no hypergraph edge)
+        // The JOIN operator can work without a pre-defined edge using hash joins
+        let num_joins = parsed.joins.len().max(join_path.len());
+        
+        for i in 0..num_joins {
             if i + 1 < table_nodes.len() {
                 let right_table = &parsed.tables[i + 1];
                 let right_op = if let Some(ref cte_ctx) = self.cte_context {
@@ -647,10 +672,13 @@ impl QueryPlanner {
                     (JoinType::Inner, pred)
                 };
                 
+                // Use edge_id from join_path if available, otherwise use EdgeId(0) (no edge)
+                let edge_id = join_path.get(i).copied().unwrap_or(crate::hypergraph::edge::EdgeId(0));
+                
                 current_op = PlanOperator::Join {
                     left: Box::new(current_op),
                     right: Box::new(right_op),
-                    edge_id: *edge_id,
+                    edge_id,
                     join_type,
                     predicate: join_predicate,
                 };
@@ -716,6 +744,7 @@ impl QueryPlanner {
                     value,
                     pattern: f.pattern.clone(),
                     in_values,
+                    subquery_expression: f.subquery_expression.clone(),
                 }
             }).collect();
             
@@ -755,9 +784,77 @@ impl QueryPlanner {
         }
         
         // Add projection
-        if !parsed.columns.is_empty() || !parsed.projection_expressions.is_empty() {
+        // IMPORTANT: Before creating ProjectOperator, add columns needed for ORDER BY to the projection
+        // SQL allows ORDER BY to reference columns not in SELECT, so we need to preserve them
+        let mut projection_columns = parsed.columns.clone();
+        let mut projection_expressions = parsed.projection_expressions.clone();
+        
+        // Collect columns needed for ORDER BY that aren't already in the projection
+        if !parsed.order_by.is_empty() {
+            for order_expr in &parsed.order_by {
+                let order_col = &order_expr.column;
+                
+                // Check if this column is already in the projection
+                // Strategy 1: Check if exact column name matches
+                let exact_match = projection_columns.contains(order_col);
+                
+                // Strategy 2: Check if column name matches any projection expression's column
+                let column_match = projection_expressions.iter().any(|expr| {
+                    match &expr.expr_type {
+                        crate::query::parser::ProjectionExprTypeInfo::Column(col) => col == order_col,
+                        _ => false,
+                    }
+                });
+                
+                // Strategy 3: Check if ORDER BY column matches an alias (e.g., ORDER BY e1.salary when SELECT has e1.salary AS emp_salary)
+                // This handles the case where ORDER BY uses qualified name but SELECT has an alias
+                let alias_match = projection_expressions.iter().any(|expr| {
+                    // Check if the alias matches the ORDER BY column (unqualified)
+                    let order_unqualified = if order_col.contains('.') {
+                        order_col.split('.').last().unwrap_or(order_col)
+                    } else {
+                        order_col
+                    };
+                    expr.alias.to_uppercase() == order_unqualified.to_uppercase() ||
+                    expr.alias.to_uppercase() == order_col.to_uppercase()
+                });
+                
+                // Strategy 4: Check if ORDER BY uses unqualified name that matches qualified column in projection
+                // (e.g., ORDER BY salary when SELECT has e1.salary AS emp_salary)
+                let unqualified_match = if !order_col.contains('.') {
+                    projection_expressions.iter().any(|expr| {
+                        match &expr.expr_type {
+                            crate::query::parser::ProjectionExprTypeInfo::Column(col) => {
+                                // Check if the column's unqualified part matches
+                                if col.contains('.') {
+                                    col.split('.').last().unwrap_or(col).to_uppercase() == order_col.to_uppercase()
+                                } else {
+                                    col.to_uppercase() == order_col.to_uppercase()
+                                }
+                            }
+                            _ => false,
+                        }
+                    })
+                } else {
+                    false
+                };
+                
+                let already_in_projection = exact_match || column_match || alias_match || unqualified_match;
+                
+                if !already_in_projection {
+                    // Add this column to projection so it's available for ORDER BY
+                    projection_columns.push(order_col.clone());
+                    projection_expressions.push(crate::query::parser::ProjectionExprInfo {
+                        alias: order_col.clone(), // Use column name as alias so it's available for ORDER BY
+                        expr_type: crate::query::parser::ProjectionExprTypeInfo::Column(order_col.clone()),
+                    });
+                }
+            }
+        }
+        
+        if !projection_columns.is_empty() || !projection_expressions.is_empty() {
             // Convert projection expressions to plan format
-            let expressions: Vec<crate::query::plan::ProjectionExpr> = parsed.projection_expressions.iter().map(|expr| {
+            let expressions: Vec<crate::query::plan::ProjectionExpr> = projection_expressions.iter().map(|expr| {
                 crate::query::plan::ProjectionExpr {
                     alias: expr.alias.clone(),
                     expr_type: match &expr.expr_type {
@@ -780,9 +877,15 @@ impl QueryPlanner {
                 }
             }).collect();
             
+            eprintln!("DEBUG planner: Creating Project operator with columns: {:?}, expressions: {:?}", 
+                projection_columns, 
+                expressions.iter().map(|e| match &e.expr_type {
+                    crate::query::plan::ProjectionExprType::Column(c) => format!("Column({})", c),
+                    _ => format!("{:?}", e.expr_type),
+                }).collect::<Vec<_>>());
             current_op = PlanOperator::Project {
                 input: Box::new(current_op),
-                columns: parsed.columns.clone(),
+                columns: projection_columns,
                 expressions,
             };
         }

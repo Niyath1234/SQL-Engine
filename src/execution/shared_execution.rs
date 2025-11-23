@@ -182,6 +182,7 @@ impl SharedScanOperator {
             value: predicate.value.clone(),
             pattern: None,
             in_values: None,
+            subquery_expression: None,
         };
         
         // Use FilterOperator

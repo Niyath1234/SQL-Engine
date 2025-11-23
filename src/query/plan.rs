@@ -154,6 +154,9 @@ pub struct FilterPredicate {
     pub in_values: Option<Vec<Value>>,
     /// For LIKE/NOT LIKE: pattern string (supports % and _ wildcards)
     pub pattern: Option<String>,
+    /// For subqueries: expression to evaluate per row (e.g., correlated subquery)
+    #[serde(skip)]
+    pub subquery_expression: Option<crate::query::expression::Expression>,
 }
 
 #[derive(Clone, Debug)]

@@ -196,43 +196,46 @@ impl ExpressionEvaluator {
     ) -> Result<Value> {
         match expr {
             Expression::Column(col_name, table_name) => {
-                // Find column in schema
-                let col_idx = if let Some(table) = table_name {
-                    // Qualified column: table.column
-                    // First, try to resolve table alias to actual table name
-                    let actual_table = self.table_aliases.get(table).map(|s| s.as_str()).unwrap_or(table);
-                    
-                    // Try different formats:
-                    // 1. alias.column (e.g., "d.id")
-                    // 2. actual_table.column (e.g., "documents.id")
-                    // 3. column (e.g., "id")
-                    self.schema.index_of(&format!("{}.{}", table, col_name))
-                        .or_else(|_| self.schema.index_of(&format!("{}.{}", actual_table, col_name)))
-                        .or_else(|_| self.schema.index_of(col_name))
+                // Use ColumnResolver for unified column resolution
+                use crate::query::column_resolver::ColumnResolver;
+                
+                // Build qualified column name if table is specified
+                let column_name = if let Some(table) = table_name {
+                    format!("{}.{}", table, col_name)
                 } else {
-                    // Unqualified column - try case-sensitive first, then case-insensitive
-                    self.schema.index_of(col_name)
-                        .or_else(|_| {
-                            // Try case-insensitive match (for aggregate columns like COUNT vs count)
-                            let upper_col = col_name.to_uppercase();
-                            let lower_col = col_name.to_lowercase();
-                            self.schema.index_of(&upper_col)
-                                .or_else(|_| self.schema.index_of(&lower_col))
-                                .or_else(|_| {
-                                    // Try finding by case-insensitive partial match
-                                    (0..self.schema.fields().len()).find(|&idx| {
-                                        let field_name = self.schema.field(idx).name();
-                                        field_name.to_uppercase() == upper_col || 
-                                        field_name.to_lowercase() == lower_col
-                                    }).ok_or_else(|| arrow::error::ArrowError::SchemaError(format!("Column not found: {}", col_name)))
-                                })
-                        })
-                }
-                .map_err(|e| anyhow::anyhow!("Column not found: {} ({})", col_name, e))?;
+                    col_name.to_string()
+                };
+                
+                // Create resolver with current schema and table aliases
+                let resolver = ColumnResolver::new(batch.batch.schema.clone(), self.table_aliases.clone());
+                
+                // Resolve column using unified resolver
+                let col_idx = resolver.resolve(&column_name)
+                    .map_err(|e| anyhow::anyhow!("Column not found: {} ({})", column_name, e))?;
                 
                 // Get value from batch
                 let array = batch.batch.column(col_idx)
                     .ok_or_else(|| anyhow::anyhow!("Column {} not found in batch", col_idx))?;
+                
+                // Bounds check: ensure row_idx is within array bounds and batch selection
+                let actual_batch_size = batch.selection.len();
+                if row_idx >= actual_batch_size {
+                    return Err(anyhow::anyhow!(
+                        "Row index {} out of bounds: batch has {} rows (selection.len()={})",
+                        row_idx,
+                        batch.row_count,
+                        actual_batch_size
+                    ));
+                }
+                
+                // Also check array length
+                if row_idx >= array.len() {
+                    return Err(anyhow::anyhow!(
+                        "Row index {} out of array bounds: array length is {}",
+                        row_idx,
+                        array.len()
+                    ));
+                }
                 
                 extract_value_from_array(array, row_idx)
             }
@@ -378,6 +381,15 @@ impl ExpressionEvaluator {
 }
 
 fn extract_value_from_array(array: &Arc<dyn Array>, idx: usize) -> Result<Value> {
+    // Bounds check to prevent array index out of bounds panics
+    if idx >= array.len() {
+        return Err(anyhow::anyhow!(
+            "Array index out of bounds: index {} >= array length {}",
+            idx,
+            array.len()
+        ));
+    }
+    
     if array.is_null(idx) {
         return Ok(Value::Null);
     }
@@ -386,16 +398,40 @@ fn extract_value_from_array(array: &Arc<dyn Array>, idx: usize) -> Result<Value>
         DataType::Int64 => {
             let arr = array.as_any().downcast_ref::<Int64Array>()
                 .ok_or_else(|| anyhow::anyhow!("Failed to downcast to Int64Array"))?;
+            // Additional bounds check for safety
+            if idx >= arr.len() {
+                return Err(anyhow::anyhow!(
+                    "Int64Array index out of bounds: index {} >= array length {}",
+                    idx,
+                    arr.len()
+                ));
+            }
             Ok(Value::Int64(arr.value(idx)))
         }
         DataType::Float64 => {
             let arr = array.as_any().downcast_ref::<Float64Array>()
                 .ok_or_else(|| anyhow::anyhow!("Failed to downcast to Float64Array"))?;
+            // Additional bounds check for safety
+            if idx >= arr.len() {
+                return Err(anyhow::anyhow!(
+                    "Float64Array index out of bounds: index {} >= array length {}",
+                    idx,
+                    arr.len()
+                ));
+            }
             Ok(Value::Float64(arr.value(idx)))
         }
         DataType::Utf8 => {
             let arr = array.as_any().downcast_ref::<StringArray>()
                 .ok_or_else(|| anyhow::anyhow!("Failed to downcast to StringArray"))?;
+            // Additional bounds check for safety
+            if idx >= arr.len() {
+                return Err(anyhow::anyhow!(
+                    "StringArray index out of bounds: index {} >= array length {}",
+                    idx,
+                    arr.len()
+                ));
+            }
             Ok(Value::String(arr.value(idx).to_string()))
         }
         DataType::FixedSizeList(field, size) => {
@@ -403,10 +439,28 @@ fn extract_value_from_array(array: &Arc<dyn Array>, idx: usize) -> Result<Value>
             let list_arr = array.as_any().downcast_ref::<FixedSizeListArray>()
                 .ok_or_else(|| anyhow::anyhow!("Failed to downcast to FixedSizeListArray"))?;
             
+            // Bounds check for FixedSizeList
+            if idx >= list_arr.len() {
+                return Err(anyhow::anyhow!(
+                    "FixedSizeListArray index out of bounds: index {} >= array length {}",
+                    idx,
+                    list_arr.len()
+                ));
+            }
+            
             let value_array = list_arr.values();
             let dimension = *size as usize;
             let start_idx = idx * dimension;
             let end_idx = start_idx + dimension;
+            
+            // Bounds check for value array access
+            if end_idx > value_array.len() {
+                return Err(anyhow::anyhow!(
+                    "FixedSizeListArray value array index out of bounds: end_idx {} > array length {}",
+                    end_idx,
+                    value_array.len()
+                ));
+            }
             
             // Check if the value array contains Float32 or Float64
             match field.data_type() {

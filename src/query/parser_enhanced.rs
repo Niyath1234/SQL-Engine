@@ -183,21 +183,37 @@ fn extract_tables_enhanced(select: &Select, cte_context: &crate::query::cte::CTE
 fn extract_columns_enhanced(select: &Select) -> Result<Vec<String>> {
     let mut columns = vec![];
     
-    for item in &select.projection {
+    eprintln!("DEBUG extract_columns_enhanced: Processing {} projection items", select.projection.len());
+    
+    for (idx, item) in select.projection.iter().enumerate() {
         match item {
             SelectItem::UnnamedExpr(expr) => {
-                // Try to extract column name from expression
+                eprintln!("DEBUG extract_columns_enhanced[{}]: UnnamedExpr - {:?}", idx, expr);
+                // Check if this is a qualified column reference (like "a.name" or "b.amount")
+                // Don't expand wildcards here - they should remain as expressions
                 if let Ok(col_name) = extract_column_name_from_expr(expr) {
-                    columns.push(col_name);
+                    eprintln!("DEBUG extract_columns_enhanced[{}]: Extracted column name: '{}'", idx, col_name);
+                    // Only push if it's not a wildcard - wildcards are handled by QualifiedWildcard
+                    if !col_name.ends_with(".*") {
+                        columns.push(col_name);
+                    } else {
+                        // This shouldn't happen (wildcards should be QualifiedWildcard), but handle it
+                        eprintln!("DEBUG extract_columns_enhanced[{}]: Warning - wildcard found in UnnamedExpr: '{}'", idx, col_name);
+                        columns.push(col_name);
+                    }
                 } else {
                     // Use expression as column name
-                    columns.push(format!("{:?}", expr));
+                    let expr_str = format!("{:?}", expr);
+                    eprintln!("DEBUG extract_columns_enhanced[{}]: Using expression as column name: '{}'", idx, expr_str);
+                    columns.push(expr_str);
                 }
             }
             SelectItem::ExprWithAlias { expr, alias } => {
+                eprintln!("DEBUG extract_columns_enhanced[{}]: ExprWithAlias - alias: '{}'", idx, alias.value);
                 columns.push(alias.value.clone());
             }
             SelectItem::Wildcard(_) => {
+                eprintln!("DEBUG extract_columns_enhanced[{}]: Wildcard - storing '*'", idx);
                 // Will be expanded later
                 columns.push("*".to_string());
             }
@@ -206,11 +222,14 @@ fn extract_columns_enhanced(select: &Select) -> Result<Vec<String>> {
                     .map(|ident| ident.value.clone())
                     .collect::<Vec<_>>()
                     .join(".");
-                columns.push(format!("{}.*", table));
+                let wildcard = format!("{}.*", table);
+                eprintln!("DEBUG extract_columns_enhanced[{}]: Found qualified wildcard '{}', storing as-is", idx, wildcard);
+                columns.push(wildcard);
             }
         }
     }
     
+    eprintln!("DEBUG extract_columns_enhanced: Final columns: {:?}", columns);
     Ok(columns)
 }
 
@@ -294,12 +313,37 @@ fn extract_joins_enhanced(select: &Select) -> Result<Vec<JoinInfo>> {
 fn extract_join_condition(expr: &Expr) -> Result<(String, String, String, String)> {
     match expr {
         Expr::BinaryOp { left, op, right } => {
+            // Handle AND clauses - extract the first equality condition for join key
+            // Other conditions will be handled as filters during execution
+            if matches!(op, sqlparser::ast::BinaryOperator::And) {
+                // Try left side first (most common pattern: equality first)
+                if let Ok(result) = extract_join_condition(left) {
+                    return Ok(result);
+                }
+                // Try right side
+                if let Ok(result) = extract_join_condition(right) {
+                    return Ok(result);
+                }
+                anyhow::bail!("Join condition with AND must contain at least one equality condition")
+            }
+            // Handle equality conditions (primary join key)
             if matches!(op, sqlparser::ast::BinaryOperator::Eq) {
                 let left_col = extract_column_ref(left)?;
                 let right_col = extract_column_ref(right)?;
                 Ok((left_col.0, left_col.1, right_col.0, right_col.1))
             } else {
-                anyhow::bail!("Join condition must be equality")
+                // For non-equality joins (e.g., <, >), we need equality for hash join
+                // But we can use the first column pair as the join key
+                // Note: Non-equality joins will require nested loop or sort-merge join
+                // For now, try to extract column references anyway
+                let left_col = extract_column_ref(left).ok();
+                let right_col = extract_column_ref(right).ok();
+                if let (Some(l), Some(r)) = (left_col, right_col) {
+                    // Use these as join keys, but execution may need special handling
+                    Ok((l.0, l.1, r.0, r.1))
+                } else {
+                    anyhow::bail!("Join condition must contain column references on both sides")
+                }
             }
         }
         _ => anyhow::bail!("Unsupported join condition")
@@ -361,22 +405,41 @@ fn extract_predicates(expr: &Expr, filters: &mut Vec<FilterInfo>) -> Result<()> 
                         };
                         
                         // Try to extract literal value, but also handle identifiers (for double-quoted strings)
-                        let value = match extract_literal_value(right.as_ref()) {
-                            Ok(v) => v,
+                        // Also handle subqueries for correlated subquery support
+                        let (value_str, subquery_expr) = match extract_literal_value(right.as_ref()) {
+                            Ok(v) => (v, None),
                             Err(_) => {
-                                // If it's not a literal, check if it's an identifier (double-quoted string)
-                                // In some SQL dialects, double quotes are used for identifiers, but we want to treat them as strings
-                                match right.as_ref() {
-                                    Expr::Identifier(ident) => ident.value.clone(),
-                                    Expr::CompoundIdentifier(idents) => {
-                                        // For compound identifiers, join them (e.g., "schema"."table" -> "schema.table")
-                                        idents.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join(".")
+                                // Check if it's a subquery (for correlated subqueries)
+                                if matches!(right.as_ref(), Expr::Subquery(_)) {
+                                    // Convert subquery AST to Expression
+                                    use crate::query::ast_to_expression::sql_expr_to_expression;
+                                    match sql_expr_to_expression(right) {
+                                        Ok(subquery_expression) => {
+                                            // Subquery expression - value will be evaluated per row
+                                            ("NULL".to_string(), Some(subquery_expression)) // Placeholder string
+                                        }
+                                        Err(e) => {
+                                            return Err(anyhow::anyhow!(
+                                                "Failed to parse subquery expression: {}", e
+                                            ));
+                                        }
                                     }
-                                    _ => {
-                                        return Err(anyhow::anyhow!(
-                                            "Right side of comparison must be a literal value or identifier. Use single quotes for string literals: 'value'"
-                                        ));
-                                    }
+                                } else {
+                                    // If it's not a literal, check if it's an identifier (double-quoted string)
+                                    // In some SQL dialects, double quotes are used for identifiers, but we want to treat them as strings
+                                    let literal_value = match right.as_ref() {
+                                        Expr::Identifier(ident) => ident.value.clone(),
+                                        Expr::CompoundIdentifier(idents) => {
+                                            // For compound identifiers, join them (e.g., "schema"."table" -> "schema.table")
+                                            idents.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join(".")
+                                        }
+                                        _ => {
+                                            return Err(anyhow::anyhow!(
+                                                "Right side of comparison must be a literal value, identifier, or subquery. Use single quotes for string literals: 'value'."
+                                            ));
+                                        }
+                                    };
+                                    (literal_value, None)
                                 }
                             }
                         };
@@ -385,9 +448,10 @@ fn extract_predicates(expr: &Expr, filters: &mut Vec<FilterInfo>) -> Result<()> 
                             table,
                             column,
                             operator,
-                            value,
+                            value: value_str,
                             pattern: None,
                             in_values: None,
+                            subquery_expression: subquery_expr,
                         });
                     }
                 }
@@ -403,6 +467,7 @@ fn extract_predicates(expr: &Expr, filters: &mut Vec<FilterInfo>) -> Result<()> 
                         value: String::new(), // Not used for LIKE
                         pattern: Some(pattern_val),
                         in_values: None,
+                        subquery_expression: None,
                     });
             }
         }
@@ -423,6 +488,7 @@ fn extract_predicates(expr: &Expr, filters: &mut Vec<FilterInfo>) -> Result<()> 
                         value: String::new(), // Not used for IN
                         pattern: None,
                         in_values: Some(in_vals),
+                        subquery_expression: None,
                     });
                 }
             }
@@ -436,6 +502,7 @@ fn extract_predicates(expr: &Expr, filters: &mut Vec<FilterInfo>) -> Result<()> 
                     value: String::new(), // Not used for IS NULL
                     pattern: None,
                     in_values: None,
+                    subquery_expression: None,
                 });
             }
         }
@@ -450,6 +517,7 @@ fn extract_predicates(expr: &Expr, filters: &mut Vec<FilterInfo>) -> Result<()> 
                         value: String::new(),
                         pattern: None,
                         in_values: None,
+                        subquery_expression: None,
                     });
                     return Ok(()); // Don't recurse further
                 }
@@ -680,6 +748,12 @@ fn extract_aggregate_from_expr(
     match expr {
         Expr::Function(func) => {
             use sqlparser::ast::{FunctionArg, FunctionArgExpr, Expr as SqlExpr};
+
+            // IMPORTANT: Skip functions with OVER clause - these are window functions, not aggregates
+            // Window functions should only be extracted by extract_window_functions_enhanced
+            if func.over.is_some() {
+                return Ok(()); // This is a window function, not a regular aggregate
+            }
 
             let func_name = func.name.to_string().to_uppercase();
             let aggregate_func = match func_name.as_str() {
@@ -1333,6 +1407,30 @@ fn extract_projection_expr(
                         .unwrap_or_else(|_| format!("{:?}", expr));
                     let alias_name = alias.unwrap_or_else(|| col_name.clone());
                     Ok((alias_name, ProjectionExprTypeInfo::Column(col_name)))
+                }
+            }
+        }
+        Expr::Value(value) => {
+            // Literal value (string, number, etc.) - create a literal expression
+            use crate::query::ast_to_expression::sql_expr_to_expression;
+            let literal_expr = sql_expr_to_expression(expr)?;
+            let alias_name = alias.unwrap_or_else(|| format!("literal_{:?}", value));
+            Ok((alias_name, ProjectionExprTypeInfo::Expression(literal_expr)))
+        }
+        Expr::BinaryOp { left, op, right } => {
+            // Arithmetic or comparison expressions (e.g., e1.salary - e2.salary, a + b, etc.)
+            // Convert to Expression enum for evaluation
+            use crate::query::ast_to_expression::sql_expr_to_expression;
+            match sql_expr_to_expression(expr) {
+                Ok(bin_expr) => {
+                    let alias_name = alias.unwrap_or_else(|| {
+                        // Generate a default alias based on operator
+                        format!("expr_{:?}", op)
+                    });
+                    Ok((alias_name, ProjectionExprTypeInfo::Expression(bin_expr)))
+                }
+                Err(e) => {
+                    anyhow::bail!("Failed to convert binary expression to Expression: {}", e)
                 }
             }
         }

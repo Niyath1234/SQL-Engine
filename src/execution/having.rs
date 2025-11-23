@@ -60,9 +60,14 @@ impl BatchIterator for HavingOperator {
         
         // Evaluate HAVING predicate for each row (group)
         let mut selection = BitVec::new();
-        selection.reserve(batch.row_count);
+        // SAFETY: Use batch.selection.len() to avoid array bounds violations
+        let actual_batch_size = batch.selection.len();
+        selection.reserve(actual_batch_size);
+        debug_assert!(actual_batch_size >= batch.row_count, 
+            "batch.selection.len() ({}) >= batch.row_count ({})", 
+            actual_batch_size, batch.row_count);
         
-        for row_idx in 0..batch.row_count {
+        for row_idx in 0..actual_batch_size {
             if batch.selection[row_idx] {
                 // Evaluate predicate (should already be rewritten to use column references)
                 match self.evaluator.evaluate(&self.predicate, &batch, row_idx) {
@@ -117,7 +122,15 @@ impl BatchIterator for HavingOperator {
     }
     
     fn schema(&self) -> SchemaRef {
-        self.input.schema()
+        // SCHEMA-FLOW: HavingOperator passes through input schema unchanged
+        let input_schema = self.input.schema();
+        
+        // SCHEMA-FLOW DEBUG: Log schema propagation
+        eprintln!("DEBUG HavingOperator::schema() - Passing through input schema with {} fields: {:?}", 
+            input_schema.fields().len(),
+            input_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+        
+        input_schema
     }
 }
 

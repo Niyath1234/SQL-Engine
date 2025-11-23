@@ -6,4 +6,5 @@ pub mod cache;
 pub mod engine;
 pub mod web;
 pub mod result_format;
+pub mod learning;
 

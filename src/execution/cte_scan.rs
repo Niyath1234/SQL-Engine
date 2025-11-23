@@ -126,9 +126,17 @@ impl BatchIterator for CTEScanOperator {
     }
     
     fn schema(&self) -> SchemaRef {
+        // SCHEMA-FLOW: CTEScanOperator returns schema from materialized batches
         // Return schema from first batch (all batches should have same schema)
         if let Some(first_batch) = self.batches.first() {
-            first_batch.batch.schema.clone()
+            let schema = first_batch.batch.schema.clone();
+            
+            // SCHEMA-FLOW DEBUG: Log schema from CTE
+            eprintln!("DEBUG CTEScanOperator::schema() - CTE schema has {} fields: {:?}", 
+                schema.fields().len(),
+                schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+            
+            schema
         } else {
             // Empty CTE - create schema from column names
             let fields: Vec<Field> = self.columns.iter()

@@ -34,7 +34,7 @@ fn create_test_fragment_string(values: Vec<&str>) -> ColumnFragment {
 
 #[test]
 fn test_zstd_compression_decompression() {
-    println!("\n§ Testing Zstd Compression...");
+    println!("\nTesting Zstd Compression...");
     
     // Create test data (1000 integers)
     let original_values: Vec<i64> = (1..=1000).collect();
@@ -93,7 +93,7 @@ fn test_zstd_compression_decompression() {
 
 #[test]
 fn test_bloom_filter() {
-    println!("\n§ Testing Bloom Filter...");
+    println!("\nTesting Bloom Filter...");
     
     // Create test data with known values
     let values: Vec<i64> = vec![10, 20, 30, 40, 50, 100, 200, 300, 400, 500];
@@ -124,7 +124,8 @@ fn test_bloom_filter() {
 
 #[test]
 fn test_bitmap_index() {
-    println!("\n§ Testing Bitmap Index...");
+    println!("
+Testing Bitmap Index...");
     
     // Create test data with some duplicate values
     let values: Vec<i64> = vec![10, 20, 10, 30, 20, 10, 40, 20, 50, 10];
@@ -154,7 +155,8 @@ fn test_bitmap_index() {
 
 #[test]
 fn test_fragment_iterator() {
-    println!("\n§ Testing Fragment Iterator...");
+    println!("
+Testing Fragment Iterator...");
     
     // Test Int64 values
     let int_values: Vec<i64> = vec![100, 200, 300, 400, 500];
@@ -207,7 +209,8 @@ fn test_fragment_iterator() {
 
 #[test]
 fn test_integrated_workflow() {
-    println!("\n§ Testing Integrated Workflow...");
+    println!("
+Testing Integrated Workflow...");
     println!("   (Compression + Indexes + Iterator)");
     
     // Create test data
@@ -251,7 +254,8 @@ fn test_integrated_workflow() {
 
 #[test]
 fn test_compression_with_different_types() {
-    println!("\n§ Testing Compression with Different Data Types...");
+    println!("
+Testing Compression with Different Data Types...");
     
     // Test Int64
     let int_values: Vec<i64> = (1..=500).collect();

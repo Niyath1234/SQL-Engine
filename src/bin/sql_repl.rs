@@ -278,7 +278,7 @@ fn main() -> anyhow::Result<()> {
     let mut engine = HypergraphSQLEngine::new();
     
     if std::path::Path::new(csv_path).exists() {
-        println!("‚ Loading data from: {}", csv_path);
+        println!(" Loading data from: {}", csv_path);
         match load_csv(csv_path) {
             Ok((row_count, columns, fragments)) => {
                 engine.load_table("adh", fragments)?;
@@ -296,7 +296,7 @@ fn main() -> anyhow::Result<()> {
     
     println!();
     println!(" Type SQL queries (or 'exit' to quit, 'help' for commands)");
-    println!("   ¬ Multi-line queries: Type each line, end with ';' to execute");
+    println!("    Multi-line queries: Type each line, end with ';' to execute");
     println!("    Commands: 'show' to view current query, 'cancel' to clear buffer");
     println!("{}", "=".repeat(80));
     println!();
@@ -336,12 +336,12 @@ fn main() -> anyhow::Result<()> {
                 line_number = 1;
                 continue;
             }
-            println!("‘‹ Goodbye!");
+            println!(" Goodbye!");
             break;
         }
         
         if line == "help" || line == "?" {
-            println!("\n– Available commands:");
+            println!("\n Available commands:");
             println!("   exit, quit, q     - Exit the REPL");
             println!("   help, ?           - Show this help");
             println!("   clear             - Clear the screen");
@@ -413,16 +413,16 @@ fn main() -> anyhow::Result<()> {
             }
             match engine.describe_table(table_name) {
                 Ok(schema) => {
-                    println!("\n‹ Table: {}", table_name);
-                    println!("{0:<30}¬{0:<20}", "");
-                    println!("‚ {:<28} ‚ {:<18} ‚", "Column", "Type");
-                    println!("{0:<30}¼{0:<20}¤", "");
+                    println!("\n Table: {}", table_name);
+                    println!("{0:<30}{0:<20}", "");
+                    println!(" {:<28}  {:<18} ", "Column", "Type");
+                    println!("{0:<30}{0:<20}", "");
                     for (col_name, col_type) in &schema {
                         // Clean up type name (remove "DataType::" prefix)
                         let clean_type = col_type.replace("DataType::", "").replace("Utf8", "VARCHAR");
-                        println!("‚ {:<28} ‚ {:<18} ‚", col_name, clean_type);
+                        println!(" {:<28}  {:<18} ", col_name, clean_type);
                     }
-                    println!("{0:<30}{0:<20}˜", "");
+                    println!("{0:<30}{0:<20}", "");
                     println!("\n{} columns\n", schema.len());
                 }
                 Err(e) => {

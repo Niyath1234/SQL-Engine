@@ -13,6 +13,8 @@ pub mod parser_enhanced;
 pub mod dml;
 pub mod ddl;
 pub mod ast_to_expression;
+pub mod column_resolver;
+pub mod wildcard_expansion;
 
 pub use parser::*;
 pub use planner::*;
@@ -24,4 +26,5 @@ pub use cte::*;
 pub use functions::*;
 pub use union::*;
 pub use parser_enhanced::*;
+pub use column_resolver::*;
 

@@ -65,6 +65,13 @@ impl ExecutionEngine {
         let start = std::time::Instant::now();
         
         // Build execution operator tree with LLM limits, CTE results, and subquery executor
+        eprintln!("DEBUG ExecutionEngine::execute_with_subquery_executor: cte_results.is_some()={}, cte_results.len()={:?}, subquery_executor.is_some()={}", 
+            cte_results.is_some(), 
+            cte_results.map(|r| r.len()).unwrap_or(0),
+            subquery_executor.is_some());
+        if let Some(ref results) = cte_results {
+            eprintln!("DEBUG ExecutionEngine::execute_with_subquery_executor: cte_results keys: {:?}", results.keys().collect::<Vec<_>>());
+        }
         let build_start = std::time::Instant::now();
         let mut root_op = crate::execution::operators::build_operator_with_subquery_executor(
             &plan.root,
@@ -133,18 +140,38 @@ impl ExecutionEngine {
     
     /// Execute a subquery Query AST (used for CTEs, scalar subqueries, etc.)
     /// This method takes a Query AST (Box<Query>) and executes it to get results
-    pub fn execute_subquery_ast(&self, query_ast: &Box<sqlparser::ast::Query>, planner: &crate::query::planner::QueryPlanner) -> Result<QueryResult> {
+    /// EDGE CASE 2 FIX: Accept CTE context and results for nested CTE support
+    pub fn execute_subquery_ast(
+        &self, 
+        query_ast: &Box<sqlparser::ast::Query>, 
+        planner: &crate::query::planner::QueryPlanner,
+        cte_context: Option<&crate::query::cte::CTEContext>,
+        cte_results: Option<&std::collections::HashMap<String, Vec<crate::execution::batch::ExecutionBatch>>>,
+    ) -> Result<QueryResult> {
         use crate::query::parser_enhanced::extract_query_info_enhanced;
+        use crate::query::wildcard_expansion::expand_wildcards_in_parsed_query;
         
         // Convert Query to Statement for extraction
         let ast = sqlparser::ast::Statement::Query(query_ast.clone());
-        let parsed = extract_query_info_enhanced(&ast)?;
+        let mut parsed = extract_query_info_enhanced(&ast)?;
         
-        // Plan the subquery
-        let subquery_plan = planner.plan_with_ast(&parsed, Some(&ast))?;
+        // WILDCARD EXPANSION: Expand wildcards BEFORE planning and execution
+        // This ensures CTE materialization uses fully expanded column lists
+        expand_wildcards_in_parsed_query(&mut parsed, &self.graph)?;
+        eprintln!("DEBUG execute_subquery_ast: After wildcard expansion, columns: {:?}", parsed.columns);
         
-        // Execute the subquery plan
-        self.execute(&subquery_plan)
+        // EDGE CASE 2 FIX: Set CTE context on planner so it can resolve CTE names
+        let planner_with_cte = if let Some(cte_ctx) = cte_context {
+            planner.clone().with_cte_context(cte_ctx.clone())
+        } else {
+            planner.clone()
+        };
+        
+        // Plan the subquery with CTE context and results available
+        let subquery_plan = planner_with_cte.plan_with_ast(&parsed, Some(&ast))?;
+        
+        // Execute the subquery plan with CTE results
+        self.execute_with_llm_limits_and_ctes(&subquery_plan, None, None, cte_results)
     }
     
     /// Execute query with parallel processing

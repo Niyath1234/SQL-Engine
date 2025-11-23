@@ -378,6 +378,7 @@ impl BatchIterator for ScanOperator {
     }
     
     fn schema(&self) -> SchemaRef {
+        // SCHEMA-FLOW: ScanOperator builds schema dynamically from fragments
         // Build schema from column names and first fragment of each column
         let fields: Vec<arrow::datatypes::Field> = self.column_fragments.iter()
             .enumerate()
@@ -405,7 +406,14 @@ impl BatchIterator for ScanOperator {
             })
             .collect();
         
-        Arc::new(Schema::new(fields))
+        let output_schema = Arc::new(Schema::new(fields));
+        
+        // SCHEMA-FLOW DEBUG: Log output schema
+        eprintln!("DEBUG ScanOperator::schema() - Output schema has {} fields: {:?}", 
+            output_schema.fields().len(),
+            output_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+        
+        output_schema
     }
 }
 
@@ -413,11 +421,48 @@ impl BatchIterator for ScanOperator {
 pub struct FilterOperator {
     input: Box<dyn BatchIterator>,
     predicates: Vec<FilterPredicate>,
+    /// Optional subquery executor for correlated subqueries
+    subquery_executor: Option<std::sync::Arc<dyn crate::query::expression::SubqueryExecutor>>,
+    /// Table aliases for column resolution (e.g., "e2" -> "employees")
+    table_aliases: std::collections::HashMap<String, String>,
 }
 
 impl FilterOperator {
     pub fn new(input: Box<dyn BatchIterator>, predicates: Vec<FilterPredicate>) -> Self {
-        Self { input, predicates }
+        Self { 
+            input, 
+            predicates,
+            subquery_executor: None,
+            table_aliases: std::collections::HashMap::new(),
+        }
+    }
+    
+    /// Create FilterOperator with subquery executor support
+    pub fn with_subquery_executor(
+        input: Box<dyn BatchIterator>, 
+        predicates: Vec<FilterPredicate>,
+        subquery_executor: Option<std::sync::Arc<dyn crate::query::expression::SubqueryExecutor>>,
+    ) -> Self {
+        Self::with_subquery_executor_and_aliases(input, predicates, subquery_executor, std::collections::HashMap::new())
+    }
+    
+    /// Create FilterOperator with subquery executor and table aliases
+    pub fn with_subquery_executor_and_aliases(
+        input: Box<dyn BatchIterator>, 
+        predicates: Vec<FilterPredicate>,
+        subquery_executor: Option<std::sync::Arc<dyn crate::query::expression::SubqueryExecutor>>,
+        table_aliases: std::collections::HashMap<String, String>,
+    ) -> Self {
+        eprintln!("DEBUG FilterOperator::with_subquery_executor: subquery_executor.is_some()={}, predicates with subquery_expr: {}, table_aliases: {:?}", 
+            subquery_executor.is_some(),
+            predicates.iter().filter(|p| p.subquery_expression.is_some()).count(),
+            table_aliases);
+        Self {
+            input,
+            predicates,
+            subquery_executor,
+            table_aliases,
+        }
     }
 }
 
@@ -430,7 +475,11 @@ impl BatchIterator for FilterOperator {
         
         // Apply predicates using SIMD-optimized filtering
         let selection = self.apply_predicates(&batch)?;
+        eprintln!("DEBUG FilterOperator::next: Before apply_selection - batch.row_count={}, selection.count_ones()={}", 
+            batch.row_count, selection.count_ones());
         batch.apply_selection(&selection);
+        eprintln!("DEBUG FilterOperator::next: After apply_selection - batch.row_count={}, batch.selection.count_ones()={}", 
+            batch.row_count, batch.selection.count_ones());
         
         Ok(Some(batch))
     }
@@ -445,20 +494,47 @@ impl FilterOperator {
         let mut selection = bitvec![1; batch.batch.row_count];
         
         for predicate in &self.predicates {
-            // Handle table-qualified column names (e.g., "q.id")
-            let resolved_col_name = if predicate.column.contains('.') {
-                let parts: Vec<&str> = predicate.column.split('.').collect();
-                if parts.len() == 2 {
-                    parts[1].to_string() // Use just column name for now
-                } else {
-                    predicate.column.clone()
+            // Use ColumnResolver for qualified column names (e.g., "e2.department_id")
+            use crate::query::column_resolver::ColumnResolver;
+            let resolver = ColumnResolver::new(batch.batch.schema.clone(), self.table_aliases.clone());
+            
+            eprintln!("DEBUG FilterOperator::apply_filter: predicate.column={:?}, predicate.value={:?}, table_aliases={:?}, schema fields: {:?}", 
+                predicate.column, predicate.value, self.table_aliases,
+                batch.batch.schema.fields().iter().map(|f| f.name().to_string()).collect::<Vec<_>>());
+            
+            // Try to resolve column using ColumnResolver (handles qualified and unqualified names)
+            let col_idx = match resolver.resolve(&predicate.column) {
+                Ok(idx) => {
+                    eprintln!("DEBUG FilterOperator::apply_filter: Resolved {} to column index {}", predicate.column, idx);
+                    idx
+                },
+                Err(e) => {
+                    eprintln!("DEBUG FilterOperator::apply_filter: Failed to resolve {}: {}, trying fallback", predicate.column, e);
+                    // Fallback: try stripping table alias
+                    let resolved_col_name = if predicate.column.contains('.') {
+                        let parts: Vec<&str> = predicate.column.split('.').collect();
+                        if parts.len() == 2 {
+                            parts[1].to_string()
+                        } else {
+                            predicate.column.clone()
+                        }
+                    } else {
+                        predicate.column.clone()
+                    };
+                    // Fallback: try with unqualified name using ColumnResolver
+                    let fallback_resolver = ColumnResolver::from_schema(batch.batch.schema.clone());
+                    let idx = fallback_resolver.resolve(&resolved_col_name)
+                        .map_err(|_| anyhow::anyhow!("Column not found: {} (tried: {}, error: {})", predicate.column, resolved_col_name, e))?;
+                    eprintln!("DEBUG FilterOperator::apply_filter: Fallback resolved {} to column index {}", resolved_col_name, idx);
+                    idx
                 }
-            } else {
-                predicate.column.clone()
             };
             
-            let column = batch.batch.column_by_name(&resolved_col_name)
-                .ok_or_else(|| anyhow::anyhow!("Column not found: {} (resolved from: {})", resolved_col_name, predicate.column))?;
+            let column = batch.batch.column(col_idx)
+                .ok_or_else(|| anyhow::anyhow!("Column index {} out of range for column: {}", col_idx, predicate.column))?;
+            
+            eprintln!("DEBUG FilterOperator::apply_filter: Column {} ({}) has {} rows, data_type={:?}", 
+                col_idx, predicate.column, column.len(), column.data_type());
             
             // Phase 2: Check if fragment is dictionary-encoded and use fast path
             // CRITICAL FIX: Integrate dictionary encoding execution
@@ -478,26 +554,29 @@ impl FilterOperator {
                                 Ok(selection) => selection,
                                 Err(e) => {
                                     eprintln!("Warning: Dictionary filter failed, falling back to normal filter: {}", e);
-                                    self.apply_filter_predicate(column, predicate)?
+                                    self.apply_filter_predicate(column, predicate, &batch)?
                                 }
                             }
                         } else {
-                            self.apply_filter_predicate(column, predicate)?
+                            self.apply_filter_predicate(column, predicate, &batch)?
                         }
                     } else {
-                        self.apply_filter_predicate(column, predicate)?
+                        self.apply_filter_predicate(column, predicate, &batch)?
                     }
                 } else {
                     // Not dictionary-encoded, use normal filtering
-                    self.apply_filter_predicate(column, predicate)?
+                    self.apply_filter_predicate(column, predicate, &batch)?
                 }
             } else {
                 // No fragment metadata available, use normal filtering
-                self.apply_filter_predicate(column, predicate)?
+                self.apply_filter_predicate(column, predicate, &batch)?
             };
             
             // Combine with existing selection (AND)
+            eprintln!("DEBUG FilterOperator::apply_filter: Before combining - selection has {} bits set, column_selection has {} bits set (predicate: {} = {:?})", 
+                selection.count_ones(), column_selection.count_ones(), predicate.column, predicate.value);
             selection &= &column_selection;
+            eprintln!("DEBUG FilterOperator::apply_filter: After combining, selection has {} bits set", selection.count_ones());
         }
         
         Ok(selection)
@@ -507,6 +586,7 @@ impl FilterOperator {
         &self,
         array: &Arc<dyn Array>,
         predicate: &FilterPredicate,
+        batch: &ExecutionBatch,
     ) -> Result<BitVec> {
         // Handle LIKE, IN, and IS NULL operators (not supported by SIMD yet)
         match predicate.operator {
@@ -520,6 +600,12 @@ impl FilterOperator {
                 return self.apply_is_null_predicate(array, &predicate.operator);
             }
             _ => {}
+        }
+        
+        // Check if this predicate has a subquery expression (correlated subquery)
+        if let Some(ref subquery_expr) = predicate.subquery_expression {
+            // Evaluate subquery per row
+            return self.apply_subquery_predicate(batch, array, &predicate.operator, subquery_expr);
         }
         
         // For other operators, use the value field
@@ -936,9 +1022,197 @@ impl FilterOperator {
         
         Ok(bitvec)
     }
+    
+    /// Apply predicate with subquery expression (correlated subquery)
+    fn apply_subquery_predicate(
+        &self,
+        batch: &ExecutionBatch,
+        column_array: &Arc<dyn Array>,
+        operator: &PredicateOperator,
+        subquery_expr: &crate::query::expression::Expression,
+    ) -> Result<BitVec> {
+        use arrow::array::*;
+        let mut bitvec = bitvec![0; batch.batch.row_count];
+        
+        // Need subquery executor
+        let executor = self.subquery_executor.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Subquery executor not provided for correlated subquery"))?;
+        
+        // Extract subquery from expression
+        let subquery = match subquery_expr {
+            crate::query::expression::Expression::Subquery(q) => q,
+            _ => {
+                return Err(anyhow::anyhow!("Expected Subquery expression, got: {:?}", subquery_expr));
+            }
+        };
+        
+        // For each row, evaluate the subquery with that row as outer context
+        // Iterate through ALL rows in the batch (not just row_count)
+        // The selection bitmap indicates which rows to process
+        let actual_batch_size = batch.selection.len();
+        for row_idx in 0..actual_batch_size {
+            // Only process rows that are selected (respects filtering)
+            if !batch.selection[row_idx] {
+                continue; // Skip filtered rows
+            }
+            
+            // Get column value for this row
+            let column_value = if column_array.is_null(row_idx) {
+                crate::storage::fragment::Value::Null
+            } else {
+                match column_array.data_type() {
+                    DataType::Int64 => {
+                        let arr = column_array.as_any().downcast_ref::<Int64Array>().unwrap();
+                        crate::storage::fragment::Value::Int64(arr.value(row_idx))
+                    }
+                    DataType::Float64 => {
+                        let arr = column_array.as_any().downcast_ref::<Float64Array>().unwrap();
+                        crate::storage::fragment::Value::Float64(arr.value(row_idx))
+                    }
+                    DataType::Utf8 => {
+                        let arr = column_array.as_any().downcast_ref::<StringArray>().unwrap();
+                        crate::storage::fragment::Value::String(arr.value(row_idx).to_string())
+                    }
+                    _ => crate::storage::fragment::Value::Null,
+                }
+            };
+            
+            // Create a single-row batch for outer context
+            let single_row_batch = self.create_single_row_batch(batch, row_idx)?;
+            
+            // Execute subquery with outer context
+            match executor.execute_scalar_subquery(subquery, Some(&single_row_batch)) {
+                Ok(Some(subquery_result)) => {
+                    // Compare column value with subquery result
+                    let matches = self.compare_values(&column_value, &subquery_result, operator);
+                    eprintln!("DEBUG subquery filter: row_idx={}, column_value={:?}, subquery_result={:?}, operator={:?}, matches={}", 
+                        row_idx, column_value, subquery_result, operator, matches);
+                    bitvec.set(row_idx, matches);
+                }
+                Ok(None) => {
+                    // Subquery returned no rows - comparison is false (NULL handling)
+                    eprintln!("DEBUG subquery filter: row_idx={}, subquery returned None", row_idx);
+                    bitvec.set(row_idx, false);
+                }
+                Err(e) => {
+                    eprintln!("DEBUG subquery filter: row_idx={}, subquery error: {}", row_idx, e);
+                    return Err(anyhow::anyhow!("Failed to execute subquery: {}", e));
+                }
+            }
+        }
+        
+        Ok(bitvec)
+    }
+    
+    /// Create a single-row batch from a full batch (for outer context)
+    fn create_single_row_batch(&self, batch: &ExecutionBatch, row_idx: usize) -> Result<ExecutionBatch> {
+        use arrow::array::*;
+        use arrow::datatypes::*;
+        
+        let mut single_row_arrays = Vec::new();
+        for col_idx in 0..batch.batch.columns.len() {
+            let col = batch.batch.column(col_idx).unwrap();
+            let field = batch.batch.schema.field(col_idx);
+            
+            // Create single-element array by extracting value from row_idx
+            let single_array: Arc<dyn Array> = match field.data_type() {
+                DataType::Int64 => {
+                    let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                    Arc::new(Int64Array::from(vec![
+                        if arr.is_null(row_idx) { None } else { Some(arr.value(row_idx)) }
+                    ]))
+                }
+                DataType::Float64 => {
+                    let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                    Arc::new(Float64Array::from(vec![
+                        if arr.is_null(row_idx) { None } else { Some(arr.value(row_idx)) }
+                    ]))
+                }
+                DataType::Utf8 => {
+                    let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                    Arc::new(StringArray::from(vec![
+                        if arr.is_null(row_idx) { None } else { Some(arr.value(row_idx).to_string()) }
+                    ]))
+                }
+                DataType::Boolean => {
+                    let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
+                    Arc::new(BooleanArray::from(vec![
+                        if arr.is_null(row_idx) { None } else { Some(arr.value(row_idx)) }
+                    ]))
+                }
+                _ => {
+                    return Err(anyhow::anyhow!("Unsupported data type for single-row batch: {:?}", field.data_type()));
+                }
+            };
+            single_row_arrays.push(single_array);
+        }
+        
+        let single_row_batch = crate::storage::columnar::ColumnarBatch::new(
+            single_row_arrays,
+            batch.batch.schema.clone(),
+        );
+        
+        let mut exec_batch = ExecutionBatch::new(single_row_batch);
+        exec_batch.selection = bitvec![1; 1]; // Single row selected
+        exec_batch.row_count = 1;
+        
+        Ok(exec_batch)
+    }
+    
+    /// Compare two values using operator
+    fn compare_values(
+        &self,
+        left: &crate::storage::fragment::Value,
+        right: &crate::storage::fragment::Value,
+        operator: &PredicateOperator,
+    ) -> bool {
+        use crate::storage::fragment::Value as V;
+        use crate::query::plan::PredicateOperator as Op;
+        
+        let cmp = match (left, right) {
+            (V::Int64(l), V::Int64(r)) => Some(l.cmp(r)),
+            (V::Float64(l), V::Float64(r)) => {
+                l.partial_cmp(r).or(Some(std::cmp::Ordering::Equal))
+            }
+            (V::String(l), V::String(r)) => Some(l.cmp(r)),
+            (V::Int64(l), V::Float64(r)) => {
+                (*l as f64).partial_cmp(r).or(Some(std::cmp::Ordering::Equal))
+            }
+            (V::Float64(l), V::Int64(r)) => {
+                l.partial_cmp(&(*r as f64)).or(Some(std::cmp::Ordering::Equal))
+            }
+            (V::Null, _) | (_, V::Null) => None,
+            _ => None,
+        };
+        
+        match (cmp, operator) {
+            (Some(order), Op::Equals) => order == std::cmp::Ordering::Equal,
+            (Some(order), Op::NotEquals) => order != std::cmp::Ordering::Equal,
+            (Some(order), Op::GreaterThan) => order == std::cmp::Ordering::Greater,
+            (Some(order), Op::LessThan) => order == std::cmp::Ordering::Less,
+            (Some(order), Op::GreaterThanOrEqual) => order != std::cmp::Ordering::Less,
+            (Some(order), Op::LessThanOrEqual) => order != std::cmp::Ordering::Greater,
+            _ => false,
+        }
+    }
+}
+
+/// Join operator state machine
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinState {
+    /// Build phase: Build hash table from right side (happens once)
+    Build,
+    /// Probe phase: Probe left batches against hash table
+    Probe,
+    /// Finished: All batches processed
+    Finished,
 }
 
 /// Join operator - performs joins using hypergraph edges
+/// Uses a state machine to prevent infinite loops:
+/// 1. Build: Build hash table from right side (once)
+/// 2. Probe: Probe left batches against hash table (one batch per next() call)
+/// 3. Finished: Return None when done
 pub struct JoinOperator {
     left: Box<dyn BatchIterator>,
     right: Box<dyn BatchIterator>,
@@ -946,6 +1220,11 @@ pub struct JoinOperator {
     predicate: JoinPredicate,
     graph: std::sync::Arc<HyperGraph>,
     edge_id: EdgeId,
+    // State machine fields
+    state: JoinState,
+    right_hash: Option<FxHashMap<Value, Vec<usize>>>,
+    right_batches: Option<Vec<ExecutionBatch>>,
+    left_exhausted: bool,
 }
 
 impl JoinOperator {
@@ -964,6 +1243,11 @@ impl JoinOperator {
             predicate,
             graph,
             edge_id,
+            // Initialize state machine
+            state: JoinState::Build,
+            right_hash: None,
+            right_batches: None,
+            left_exhausted: false,
         }
     }
 }
@@ -980,150 +1264,307 @@ impl BatchIterator for JoinOperator {
     }
     
     fn schema(&self) -> SchemaRef {
-        // Combine schemas from left and right
-        let mut fields = self.left.schema().fields().to_vec();
-        fields.extend_from_slice(self.right.schema().fields());
+        // SCHEMA-FLOW: JoinOperator combines left and right schemas dynamically
+        // Combine schemas from left and right, qualifying column names to avoid duplicates
+        // For cascading JOINs, we need to ensure uniqueness even if columns are already qualified
+        
+        // Get input schemas dynamically (always current)
+        let left_schema = self.left.schema();
+        let right_schema = self.right.schema();
+        
+        // SCHEMA-FLOW DEBUG: Log input schemas
+        eprintln!("DEBUG JoinOperator::schema() - Left schema has {} fields: {:?}", 
+            left_schema.fields().len(),
+            left_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+        eprintln!("DEBUG JoinOperator::schema() - Right schema has {} fields: {:?}", 
+            right_schema.fields().len(),
+            right_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+        
+        let mut fields = vec![];
+        let mut seen_names = std::collections::HashSet::new();
+        
+        // Get table aliases from predicate (left.0 and right.0 are table aliases)
+        let left_table_alias = &self.predicate.left.0;
+        let right_table_alias = &self.predicate.right.0;
+        
+        // Add left columns, qualified with table alias if not already qualified
+        for field in left_schema.fields() {
+            let field_name = field.name();
+            // If field is already qualified (contains '.'), use as-is
+            // Otherwise, qualify with table alias
+            let mut qualified_name = if field_name.contains('.') {
+                field_name.clone()
+            } else {
+                format!("{}.{}", left_table_alias, field_name)
+            };
+            
+            // For cascading JOINs: if this name already exists, ensure uniqueness
+            // by adding a suffix or using the table alias prefix
+            let mut counter = 0;
+            let original_name = qualified_name.clone();
+            while seen_names.contains(&qualified_name) {
+                counter += 1;
+                qualified_name = format!("{}_{}", original_name, counter);
+            }
+            seen_names.insert(qualified_name.clone());
+            
+            fields.push(arrow::datatypes::Field::new(
+                qualified_name,
+                field.data_type().clone(),
+                field.is_nullable(),
+            ));
+        }
+        
+        // Add right columns, qualified with table alias if not already qualified
+        for field in right_schema.fields() {
+            let field_name = field.name();
+            // If field is already qualified (contains '.'), use as-is
+            // Otherwise, qualify with table alias
+            let mut qualified_name = if field_name.contains('.') {
+                field_name.clone()
+            } else {
+                format!("{}.{}", right_table_alias, field_name)
+            };
+            
+            // For cascading JOINs: if this name already exists, ensure uniqueness
+            // by adding a suffix or using the table alias prefix
+            let mut counter = 0;
+            let original_name = qualified_name.clone();
+            while seen_names.contains(&qualified_name) {
+                counter += 1;
+                qualified_name = format!("{}_{}", original_name, counter);
+            }
+            seen_names.insert(qualified_name.clone());
+            
+            fields.push(arrow::datatypes::Field::new(
+                qualified_name,
+                field.data_type().clone(),
+                field.is_nullable(),
+            ));
+        }
+        
         Arc::new(Schema::new(fields))
     }
 }
 
 impl JoinOperator {
+    /// Helper: Create empty batch with combined schema
+    fn create_empty_batch(&self) -> Result<ExecutionBatch> {
+        let combined_schema = self.schema();
+        let empty_columns: Vec<Arc<dyn Array>> = combined_schema.fields().iter().map(|field| {
+            match field.data_type() {
+                &arrow::datatypes::DataType::Int64 => Arc::new(Int64Array::from(vec![] as Vec<Option<i64>>)) as Arc<dyn Array>,
+                &arrow::datatypes::DataType::Float64 => Arc::new(Float64Array::from(vec![] as Vec<Option<f64>>)) as Arc<dyn Array>,
+                &arrow::datatypes::DataType::Utf8 => Arc::new(StringArray::from(vec![] as Vec<Option<String>>)) as Arc<dyn Array>,
+                &arrow::datatypes::DataType::Boolean => Arc::new(BooleanArray::from(vec![] as Vec<Option<bool>>)) as Arc<dyn Array>,
+                _ => Arc::new(StringArray::from(vec![] as Vec<Option<String>>)) as Arc<dyn Array>,
+            }
+        }).collect();
+        let output_batch = crate::storage::columnar::ColumnarBatch::new(empty_columns, combined_schema);
+        let mut exec_batch = ExecutionBatch::new(output_batch);
+        exec_batch.selection = BitVec::new();
+        exec_batch.row_count = 0;
+        Ok(exec_batch)
+    }
+    
+    /// Helper: Resolve key column index
+    fn resolve_key_column(&self, schema: &SchemaRef, table_alias: &str, column_name: &str) -> Option<usize> {
+        schema.index_of(column_name).ok()
+            .or_else(|| {
+                let qualified = format!("{}.{}", table_alias, column_name);
+                schema.index_of(&qualified).ok()
+            })
+    }
+    
     fn execute_inner_join(&mut self) -> Result<Option<ExecutionBatch>> {
-        // Build hash table from right side (smaller table)
-        let mut right_hash: FxHashMap<Value, Vec<usize>> = FxHashMap::default();
-        let mut right_batches = vec![];
-        
-        // Collect all right batches
-        while let Some(batch) = self.right.next()? {
-            right_batches.push(batch);
-        }
-        
-        // If right side is empty, return empty batch with combined schema
-        // This ensures ProjectOperator can resolve columns from both tables
-        if right_batches.is_empty() {
-            let mut combined_fields = self.left.schema().fields().to_vec();
-            combined_fields.extend_from_slice(self.right.schema().fields());
-            let combined_schema = Arc::new(Schema::new(combined_fields.clone()));
-            
-            // Create empty arrays for each column in combined schema
-            let empty_columns: Vec<Arc<dyn Array>> = combined_fields.iter().map(|field| {
-                match field.data_type() {
-                    &arrow::datatypes::DataType::Int64 => Arc::new(Int64Array::from(vec![] as Vec<Option<i64>>)) as Arc<dyn Array>,
-                    &arrow::datatypes::DataType::Float64 => Arc::new(Float64Array::from(vec![] as Vec<Option<f64>>)) as Arc<dyn Array>,
-                    &arrow::datatypes::DataType::Utf8 => Arc::new(StringArray::from(vec![] as Vec<Option<String>>)) as Arc<dyn Array>,
-                    &arrow::datatypes::DataType::Boolean => Arc::new(BooleanArray::from(vec![] as Vec<Option<bool>>)) as Arc<dyn Array>,
-                    _ => Arc::new(StringArray::from(vec![] as Vec<Option<String>>)) as Arc<dyn Array>,
+        // STATE MACHINE: Handle different states
+        match self.state {
+            JoinState::Build => {
+                // Build hash table from right side (happens once)
+                let mut right_batches = vec![];
+                
+                // Collect all right batches
+                while let Some(batch) = self.right.next()? {
+                    right_batches.push(batch);
                 }
-            }).collect();
-            
-            let output_batch = crate::storage::columnar::ColumnarBatch::new(empty_columns, combined_schema);
-            let mut exec_batch = ExecutionBatch::new(output_batch);
-            exec_batch.selection = BitVec::new();
-            exec_batch.row_count = 0;
-            return Ok(Some(exec_batch));
-        }
-        
-        // Build hash table from right side
-        let right_key_col = self.right.schema().index_of(&self.predicate.right.1).ok();
-        if right_key_col.is_none() {
-            // Key column not found - return empty batch with combined schema
-            let mut combined_fields = self.left.schema().fields().to_vec();
-            combined_fields.extend_from_slice(self.right.schema().fields());
-            let combined_schema = Arc::new(Schema::new(combined_fields.clone()));
-            
-            let empty_columns: Vec<Arc<dyn Array>> = combined_fields.iter().map(|field| {
-                match field.data_type() {
-                    &arrow::datatypes::DataType::Int64 => Arc::new(Int64Array::from(vec![] as Vec<Option<i64>>)) as Arc<dyn Array>,
-                    &arrow::datatypes::DataType::Float64 => Arc::new(Float64Array::from(vec![] as Vec<Option<f64>>)) as Arc<dyn Array>,
-                    &arrow::datatypes::DataType::Utf8 => Arc::new(StringArray::from(vec![] as Vec<Option<String>>)) as Arc<dyn Array>,
-                    &arrow::datatypes::DataType::Boolean => Arc::new(BooleanArray::from(vec![] as Vec<Option<bool>>)) as Arc<dyn Array>,
-                    _ => Arc::new(StringArray::from(vec![] as Vec<Option<String>>)) as Arc<dyn Array>,
+                
+                // If right side is empty, return empty batch and finish
+                if right_batches.is_empty() {
+                    self.state = JoinState::Finished;
+                    return Ok(Some(self.create_empty_batch()?));
                 }
-            }).collect();
-            
-            let output_batch = crate::storage::columnar::ColumnarBatch::new(empty_columns, combined_schema);
-            let mut exec_batch = ExecutionBatch::new(output_batch);
-            exec_batch.selection = BitVec::new();
-            exec_batch.row_count = 0;
-            return Ok(Some(exec_batch));
-        }
-        let right_key_idx = right_key_col.unwrap();
-        
-        for (batch_idx, batch) in right_batches.iter().enumerate() {
-            if let Some(key_array) = batch.batch.column(right_key_idx) {
-                for row_idx in 0..batch.row_count {
-                    if batch.selection[row_idx] {
-                        let key = extract_value(key_array, row_idx)?;
-                        right_hash.entry(key).or_insert_with(Vec::new).push((batch_idx << 16) | row_idx);
+                
+                // Store right batches for reuse
+                self.right_batches = Some(right_batches);
+                
+                // Build hash table from right batches
+                let mut right_hash: FxHashMap<Value, Vec<usize>> = FxHashMap::default();
+                
+                // Resolve right key column
+                let right_key_idx = match self.resolve_key_column(&self.right.schema(), &self.predicate.right.0, &self.predicate.right.1) {
+                    Some(idx) => idx,
+                    None => {
+                        // Key column not found - return empty batch and finish
+                        self.state = JoinState::Finished;
+                        return Ok(Some(self.create_empty_batch()?));
+                    }
+                };
+                
+                // Build hash table from right batches
+                let right_batches_ref = self.right_batches.as_ref().unwrap();
+                for (batch_idx, batch) in right_batches_ref.iter().enumerate() {
+                    if let Some(key_array) = batch.batch.column(right_key_idx) {
+                        let actual_batch_size = batch.selection.len();
+                        for row_idx in 0..actual_batch_size {
+                            if batch.selection[row_idx] && row_idx < key_array.len() {
+                                if let Ok(key) = extract_value(key_array, row_idx) {
+                                    right_hash.entry(key).or_insert_with(Vec::new).push((batch_idx << 16) | row_idx);
+                                }
+                            }
+                        }
                     }
                 }
+                
+                // Store hash table
+                self.right_hash = Some(right_hash);
+                
+                // Move to Probe state
+                self.state = JoinState::Probe;
+            }
+            JoinState::Finished => {
+                return Ok(None);
+            }
+            JoinState::Probe => {
+                // Continue to probe phase (hash table already built)
             }
         }
         
-        // Probe left side against hash table
-        let left_key_col = self.left.schema().index_of(&self.predicate.left.1).ok();
-        if left_key_col.is_none() {
-            // Key column not found - return empty batch with combined schema
-            let mut combined_fields = self.left.schema().fields().to_vec();
-            combined_fields.extend_from_slice(self.right.schema().fields());
-            let combined_schema = Arc::new(Schema::new(combined_fields.clone()));
-            
-            let empty_columns: Vec<Arc<dyn Array>> = combined_fields.iter().map(|field| {
-                match field.data_type() {
-                    &arrow::datatypes::DataType::Int64 => Arc::new(Int64Array::from(vec![] as Vec<Option<i64>>)) as Arc<dyn Array>,
-                    &arrow::datatypes::DataType::Float64 => Arc::new(Float64Array::from(vec![] as Vec<Option<f64>>)) as Arc<dyn Array>,
-                    &arrow::datatypes::DataType::Utf8 => Arc::new(StringArray::from(vec![] as Vec<Option<String>>)) as Arc<dyn Array>,
-                    &arrow::datatypes::DataType::Boolean => Arc::new(BooleanArray::from(vec![] as Vec<Option<bool>>)) as Arc<dyn Array>,
-                    _ => Arc::new(StringArray::from(vec![] as Vec<Option<String>>)) as Arc<dyn Array>,
-                }
-            }).collect();
-            
-            let output_batch = crate::storage::columnar::ColumnarBatch::new(empty_columns, combined_schema);
-            let mut exec_batch = ExecutionBatch::new(output_batch);
-            exec_batch.selection = BitVec::new();
-            exec_batch.row_count = 0;
-            return Ok(Some(exec_batch));
-        }
-        let left_key_idx = left_key_col.unwrap();
-        
-        // Get next left batch
-        let left_batch = match self.left.next()? {
-            Some(b) => b,
-            None => return Ok(None),
+        // PROBE PHASE: Use cached hash table and right batches
+        let right_batches = match &self.right_batches {
+            Some(batches) => batches,
+            None => {
+                // This should not happen if state machine is correct, but handle gracefully
+                self.state = JoinState::Finished;
+                return Ok(None);
+            }
         };
         
-        // Build output columns
+        // Get the hash table (we know it exists now since we're in Probe state)
+        let right_hash = self.right_hash.as_ref().unwrap();
+        
+        // Resolve left key column
+        let left_key_idx = match self.resolve_key_column(&self.left.schema(), &self.predicate.left.0, &self.predicate.left.1) {
+            Some(idx) => idx,
+            None => {
+                // Key column not found - return empty batch
+                return Ok(Some(self.create_empty_batch()?));
+            }
+        };
+        
+        // Get next left batch - if exhausted, move to Finished state
+        let left_batch = match self.left.next()? {
+            Some(b) => b,
+            None => {
+                // Left exhausted - move to Finished state
+                self.state = JoinState::Finished;
+                return Ok(None);
+            }
+        };
+        
+        // If we don't have key indices, return empty batch
+        let right_key_idx = match self.resolve_key_column(&self.right.schema(), &self.predicate.right.0, &self.predicate.right.1) {
+            Some(idx) => idx,
+            None => {
+                return Ok(Some(self.create_empty_batch()?));
+            }
+        };
+        
+        // Build output columns with qualified names to avoid duplicates
+        // For cascading JOINs, we need to ensure uniqueness even if columns are already qualified
         let mut output_columns = vec![];
         let mut output_schema_fields = vec![];
+        let mut seen_names = std::collections::HashSet::new();
         
-        // Add left columns
+        // Get table aliases from predicate
+        let left_table_alias = &self.predicate.left.0;
+        let right_table_alias = &self.predicate.right.0;
+        
+        // Add left columns, qualified with table alias if not already qualified
         for (idx, field) in self.left.schema().fields().iter().enumerate() {
             output_columns.push(left_batch.batch.column(idx).unwrap().clone());
-            output_schema_fields.push(field.clone());
+            let field_name = field.name();
+            let mut qualified_name = if field_name.contains('.') {
+                field_name.clone()
+            } else {
+                format!("{}.{}", left_table_alias, field_name)
+            };
+            
+            // For cascading JOINs: if this name already exists, ensure uniqueness
+            let mut counter = 0;
+            let original_name = qualified_name.clone();
+            while seen_names.contains(&qualified_name) {
+                counter += 1;
+                qualified_name = format!("{}_{}", original_name, counter);
+            }
+            seen_names.insert(qualified_name.clone());
+            
+            output_schema_fields.push(arrow::datatypes::Field::new(
+                qualified_name,
+                field.data_type().clone(),
+                field.is_nullable(),
+            ));
         }
         
         // Add right columns - use first right batch for structure (all batches have same schema)
         if !right_batches.is_empty() {
             for (idx, field) in self.right.schema().fields().iter().enumerate() {
                 output_columns.push(right_batches[0].batch.column(idx).unwrap().clone());
-                output_schema_fields.push(field.clone());
+                let field_name = field.name();
+                let mut qualified_name = if field_name.contains('.') {
+                    field_name.clone()
+                } else {
+                    format!("{}.{}", right_table_alias, field_name)
+                };
+                
+                // For cascading JOINs: if this name already exists, ensure uniqueness
+                let mut counter = 0;
+                let original_name = qualified_name.clone();
+                while seen_names.contains(&qualified_name) {
+                    counter += 1;
+                    qualified_name = format!("{}_{}", original_name, counter);
+                }
+                seen_names.insert(qualified_name.clone());
+                
+                output_schema_fields.push(arrow::datatypes::Field::new(
+                    qualified_name,
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                ));
             }
         }
         
-        // Build join result
+        // Probe left batch against hash table and build join result
         let mut result_rows = 0;
         let mut result_selection = BitVec::new();
         
         if let Some(key_array) = left_batch.batch.column(left_key_idx) {
-            for row_idx in 0..left_batch.row_count {
-                if left_batch.selection[row_idx] {
+            // SAFETY: Iterate only up to batch.batch.row_count to avoid array bounds violations
+            let max_rows = left_batch.batch.row_count;
+            for row_idx in 0..max_rows {
+                // Check if row is selected (and within selection bitmap bounds)
+                if row_idx >= left_batch.selection.len() || !left_batch.selection[row_idx] {
+                    continue;
+                }
+                if row_idx < key_array.len() {
                     let key = extract_value(key_array, row_idx)?;
                     if let Some(right_indices) = right_hash.get(&key) {
+                        // INNER JOIN: only include matched rows
                         for &right_idx in right_indices {
                             result_rows += 1;
                             result_selection.push(true);
                         }
                     }
+                    // INNER JOIN: unmatched rows are skipped (not included in result)
                 }
             }
         }
@@ -1148,9 +1589,12 @@ impl JoinOperator {
             let mut exec_batch = ExecutionBatch::new(output_batch);
             exec_batch.selection = BitVec::new();
             exec_batch.row_count = 0;
+            // Return empty batch (don't finish - there might be more left batches)
             return Ok(Some(exec_batch));
         }
         
+        // TODO: For now, return structure - proper row materialization from matched indices would go here
+        // This is simplified - actual implementation would materialize rows from left_batch and right_batches
         let output_batch = crate::storage::columnar::ColumnarBatch::new(output_columns, output_schema);
         
         let mut exec_batch = ExecutionBatch::new(output_batch);
@@ -1160,77 +1604,171 @@ impl JoinOperator {
     }
     
     fn execute_left_join(&mut self) -> Result<Option<ExecutionBatch>> {
-        // LEFT JOIN: all rows from left, matched rows from right (NULLs for non-matches)
-        // Similar to INNER JOIN but include unmatched left rows
-        let mut right_hash: FxHashMap<Value, Vec<usize>> = FxHashMap::default();
-        let mut right_batches = vec![];
-        
-        // Collect all right batches
-        while let Some(batch) = self.right.next()? {
-            right_batches.push(batch);
-        }
-        
-        let right_key_idx = self.right.schema().index_of(&self.predicate.right.1)
-            .map_err(|_| anyhow::anyhow!("Right join key not found"))?;
-        
-        // Build hash table from right side
-        for (batch_idx, batch) in right_batches.iter().enumerate() {
-            if let Some(key_array) = batch.batch.column(right_key_idx) {
-                for row_idx in 0..batch.row_count {
-                    if batch.selection[row_idx] {
-                        let key = extract_value(key_array, row_idx)?;
-                        right_hash.entry(key).or_insert_with(Vec::new).push((batch_idx << 16) | row_idx);
+        // STATE MACHINE: Handle different states
+        match self.state {
+            JoinState::Build => {
+                // Build hash table from right side (happens once)
+                let mut right_batches = vec![];
+                
+                // Collect all right batches
+                while let Some(batch) = self.right.next()? {
+                    right_batches.push(batch);
+                }
+                
+                // If right side is empty, store empty batches and continue (LEFT JOIN includes all left rows)
+                self.right_batches = Some(right_batches);
+                
+                // Build hash table from right batches (even if empty)
+                let mut right_hash: FxHashMap<Value, Vec<usize>> = FxHashMap::default();
+                
+                // Resolve right key column and build hash table
+                if let Some(right_key_idx) = self.resolve_key_column(&self.right.schema(), &self.predicate.right.0, &self.predicate.right.1) {
+                    let right_batches_ref = self.right_batches.as_ref().unwrap();
+                    for (batch_idx, batch) in right_batches_ref.iter().enumerate() {
+                        if let Some(key_array) = batch.batch.column(right_key_idx) {
+                            let actual_batch_size = batch.selection.len();
+                            for row_idx in 0..actual_batch_size {
+                                if batch.selection[row_idx] && row_idx < key_array.len() {
+                                    if let Ok(key) = extract_value(key_array, row_idx) {
+                                        right_hash.entry(key).or_insert_with(Vec::new).push((batch_idx << 16) | row_idx);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+                // If key column not found, hash table remains empty (LEFT JOIN will still process left rows)
+                
+                // Store hash table
+                self.right_hash = Some(right_hash);
+                
+                // Move to Probe state
+                self.state = JoinState::Probe;
+            }
+            JoinState::Finished => {
+                return Ok(None);
+            }
+            JoinState::Probe => {
+                // Continue to probe phase (hash table already built)
             }
         }
         
-        let left_key_idx = self.left.schema().index_of(&self.predicate.left.1)
-            .map_err(|_| anyhow::anyhow!("Left join key not found"))?;
-        
-        let left_batch = match self.left.next()? {
-            Some(b) => b,
-            None => return Ok(None),
+        // PROBE PHASE: Use cached hash table and right batches
+        let right_batches = match &self.right_batches {
+            Some(batches) => batches,
+            None => {
+                self.state = JoinState::Finished;
+                return Ok(None);
+            }
         };
         
-        // Build output with NULLs for unmatched right columns
+        // Get the hash table (we know it exists now since we're in Probe state)
+        let right_hash = self.right_hash.as_ref().unwrap();
+        
+        // Resolve left key column
+        let left_key_idx = match self.resolve_key_column(&self.left.schema(), &self.predicate.left.0, &self.predicate.left.1) {
+            Some(idx) => idx,
+            None => {
+                // Key column not found - return empty batch
+                return Ok(Some(self.create_empty_batch()?));
+            }
+        };
+        
+        // Get next left batch - if exhausted, move to Finished state
+        let left_batch = match self.left.next()? {
+            Some(b) => b,
+            None => {
+                // Left exhausted - move to Finished state
+                self.state = JoinState::Finished;
+                return Ok(None);
+            }
+        };
+        
+        // Build output columns with qualified names
         let mut output_columns = vec![];
         let mut output_schema_fields = vec![];
+        let mut seen_names = std::collections::HashSet::new();
         
-        // Add left columns
+        let left_table_alias = &self.predicate.left.0;
+        let right_table_alias = &self.predicate.right.0;
+        
+        // Add left columns, qualified
         for (idx, field) in self.left.schema().fields().iter().enumerate() {
             output_columns.push(left_batch.batch.column(idx).unwrap().clone());
-            output_schema_fields.push(field.clone());
+            let field_name = field.name();
+            let mut qualified_name = if field_name.contains('.') {
+                field_name.clone()
+            } else {
+                format!("{}.{}", left_table_alias, field_name)
+            };
+            
+            let mut counter = 0;
+            let original_name = qualified_name.clone();
+            while seen_names.contains(&qualified_name) {
+                counter += 1;
+                qualified_name = format!("{}_{}", original_name, counter);
+            }
+            seen_names.insert(qualified_name.clone());
+            
+            output_schema_fields.push(arrow::datatypes::Field::new(
+                qualified_name,
+                field.data_type().clone(),
+                field.is_nullable(),
+            ));
         }
         
-        // Add right columns (will be NULL-filled for unmatched rows)
+        // Add right columns (will be NULL-filled for unmatched), qualified
         let right_schema = self.right.schema();
         for (idx, field) in right_schema.fields().iter().enumerate() {
-            output_schema_fields.push(field.clone());
+            let field_name = field.name();
+            let mut qualified_name = if field_name.contains('.') {
+                field_name.clone()
+            } else {
+                format!("{}.{}", right_table_alias, field_name)
+            };
+            
+            let mut counter = 0;
+            let original_name = qualified_name.clone();
+            while seen_names.contains(&qualified_name) {
+                counter += 1;
+                qualified_name = format!("{}_{}", original_name, counter);
+            }
+            seen_names.insert(qualified_name.clone());
+            
+            output_schema_fields.push(arrow::datatypes::Field::new(
+                qualified_name,
+                field.data_type().clone(),
+                field.is_nullable(),
+            ));
         }
         
-        // Build join result
+        // Build join result - LEFT JOIN includes ALL left rows
         let mut result_rows = 0;
         let mut result_selection = BitVec::new();
-        let mut left_row_indices = vec![];
-        let mut right_row_indices = vec![];
         
         if let Some(key_array) = left_batch.batch.column(left_key_idx) {
-            for row_idx in 0..left_batch.row_count {
-                if left_batch.selection[row_idx] {
-                    let key = extract_value(key_array, row_idx)?;
-                    if let Some(right_indices) = right_hash.get(&key) {
-                        // Matched: add all matching right rows
-                        for &right_idx in right_indices {
-                            left_row_indices.push(row_idx);
-                            right_row_indices.push(Some(right_idx));
+            // SAFETY: Iterate only up to batch.batch.row_count to avoid array bounds violations
+            let max_rows = left_batch.batch.row_count;
+            for row_idx in 0..max_rows {
+                // Check if row is selected (and within selection bitmap bounds)
+                if row_idx >= left_batch.selection.len() || !left_batch.selection[row_idx] {
+                    continue;
+                }
+                if row_idx < key_array.len() {
+                    if let Ok(key) = extract_value(key_array, row_idx) {
+                        if let Some(right_indices) = right_hash.get(&key) {
+                            // Matched: add all matching right rows
+                            for &_right_idx in right_indices {
+                                result_rows += 1;
+                                result_selection.push(true);
+                            }
+                        } else {
+                            // Unmatched: LEFT JOIN includes this row with NULL right columns
                             result_rows += 1;
                             result_selection.push(true);
                         }
                     } else {
-                        // Unmatched: add left row with NULL right columns
-                        left_row_indices.push(row_idx);
-                        right_row_indices.push(None);
+                        // NULL key: LEFT JOIN includes this row
                         result_rows += 1;
                         result_selection.push(true);
                     }
@@ -1239,7 +1777,8 @@ impl JoinOperator {
         }
         
         if result_rows == 0 {
-            return Ok(None);
+            // Return empty batch with correct schema
+            return Ok(Some(self.create_empty_batch()?));
         }
         
         // Build output arrays
@@ -1251,13 +1790,11 @@ impl JoinOperator {
             final_output_columns.push(left_col.clone());
         }
         
-        // Right columns (with NULLs for unmatched)
+        // Right columns (with NULLs for unmatched - TODO: fill matched values properly)
         for (idx, field) in right_schema.fields().iter().enumerate() {
             let null_array = create_null_array(field.data_type(), result_rows)?;
             final_output_columns.push(null_array);
         }
-        
-        // TODO: Fill in matched right values (simplified for now)
         
         let output_schema = Arc::new(Schema::new(output_schema_fields));
         let output_batch = crate::storage::columnar::ColumnarBatch::new(final_output_columns, output_schema);
@@ -1298,17 +1835,50 @@ fn create_null_array(data_type: &DataType, len: usize) -> Result<Arc<dyn Array>>
 }
 
 fn extract_value(array: &Arc<dyn Array>, idx: usize) -> Result<Value> {
+    // Bounds check to prevent array index out of bounds panics
+    if idx >= array.len() {
+        return Err(anyhow::anyhow!(
+            "Array index out of bounds: index {} >= array length {}",
+            idx,
+            array.len()
+        ));
+    }
+    
     match array.data_type() {
         DataType::Int64 => {
             let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            // Additional bounds check for safety
+            if idx >= arr.len() {
+                return Err(anyhow::anyhow!(
+                    "Int64Array index out of bounds: index {} >= array length {}",
+                    idx,
+                    arr.len()
+                ));
+            }
             Ok(Value::Int64(arr.value(idx)))
         }
         DataType::Float64 => {
             let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
+            // Additional bounds check for safety
+            if idx >= arr.len() {
+                return Err(anyhow::anyhow!(
+                    "Float64Array index out of bounds: index {} >= array length {}",
+                    idx,
+                    arr.len()
+                ));
+            }
             Ok(Value::Float64(arr.value(idx)))
         }
         DataType::Utf8 => {
             let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
+            // Additional bounds check for safety
+            if idx >= arr.len() {
+                return Err(anyhow::anyhow!(
+                    "StringArray index out of bounds: index {} >= array length {}",
+                    idx,
+                    arr.len()
+                ));
+            }
             Ok(Value::String(arr.value(idx).to_string()))
         }
         _ => anyhow::bail!("Unsupported type for join key"),
@@ -1325,6 +1895,8 @@ pub struct AggregateOperator {
     finished: bool,
     /// Unique instance ID for debugging
     instance_id: usize,
+    /// Table aliases for column resolution (e.g., "e2" -> "employees")
+    table_aliases: std::collections::HashMap<String, String>,
 }
 
 // Static counter for instance IDs
@@ -1347,6 +1919,15 @@ impl AggregateOperator {
         group_by: Vec<String>,
         aggregates: Vec<AggregateExpr>,
     ) -> Self {
+        Self::with_table_aliases(input, group_by, aggregates, std::collections::HashMap::new())
+    }
+    
+    pub fn with_table_aliases(
+        input: Box<dyn BatchIterator>,
+        group_by: Vec<String>,
+        aggregates: Vec<AggregateExpr>,
+        table_aliases: std::collections::HashMap<String, String>,
+    ) -> Self {
         let instance_id = unsafe {
             AGG_INSTANCE_COUNTER += 1;
             AGG_INSTANCE_COUNTER
@@ -1361,6 +1942,7 @@ impl AggregateOperator {
             },
             finished: false,
             instance_id,
+            table_aliases,
         }
     }
 }
@@ -1383,6 +1965,8 @@ impl BatchIterator for AggregateOperator {
             // 2. Extract compressed data (RLE/Dictionary)
             // 3. Use aggregate_sum_rle(), aggregate_count_rle(), etc. from compressed_execution module
             
+            eprintln!(" DEBUG: AggregateOperator[{}]::next - processing batch: row_count={}, selection.count_ones()={}", 
+                self.instance_id, batch.row_count, batch.selection.count_ones());
             self.process_batch(&batch)?;
         }
         
@@ -1472,7 +2056,8 @@ impl BatchIterator for AggregateOperator {
                         if agg_vals.counts[i] > 0 {
                             Value::Float64(agg_vals.sums[i] / agg_vals.counts[i] as f64)
                         } else {
-                            Value::Float64(0.0)
+                            // AVG of empty set should be NULL, not 0.0
+                            Value::Null
                         }
                     }
                     AggregateFunction::Min => agg_vals.mins[i].clone().unwrap_or(Value::Null),
@@ -1732,8 +2317,11 @@ impl BatchIterator for AggregateOperator {
     }
     
     fn schema(&self) -> SchemaRef {
-        // Build schema with group_by columns + aggregate columns
+        // SCHEMA-FLOW: AggregateOperator builds schema from group_by + aggregates
         // CRITICAL: Use centralized type function to ensure consistency with batch creation
+        // NOTE: AggregateOperator doesn't pass through input schema - it creates a new schema
+        // from group_by columns and aggregate results
+        
         let mut fields = vec![];
         for col_name in &self.group_by {
             fields.push(Field::new(col_name, DataType::Utf8, true));
@@ -1757,7 +2345,15 @@ impl BatchIterator for AggregateOperator {
             let data_type = crate::execution::type_conversion::aggregate_return_type(&agg.function);
             fields.push(Field::new(&field_name, data_type, true));
         }
-        Arc::new(Schema::new(fields))
+        
+        let output_schema = Arc::new(Schema::new(fields));
+        
+        // SCHEMA-FLOW DEBUG: Log output schema
+        eprintln!("DEBUG AggregateOperator::schema() - Output schema has {} fields: {:?}", 
+            output_schema.fields().len(),
+            output_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+        
+        output_schema
     }
 }
 
@@ -1765,6 +2361,8 @@ impl AggregateOperator {
     fn process_batch(&mut self, batch: &ExecutionBatch) -> Result<()> {
         eprintln!(" DEBUG: process_batch called");
         eprintln!("   - batch.row_count: {}", batch.row_count);
+        eprintln!("   - batch.selection.count_ones(): {}", batch.selection.count_ones());
+        eprintln!("   - batch.selection.len(): {}", batch.selection.len());
         eprintln!("   - aggregates.len(): {}", self.aggregates.len());
         eprintln!("   - group_by.len(): {}", self.group_by.len());
         
@@ -1774,12 +2372,17 @@ impl AggregateOperator {
         }
         
         // Extract group keys and update aggregates incrementally
+        use crate::query::column_resolver::ColumnResolver;
+        let resolver = ColumnResolver::new(batch.batch.schema.clone(), self.table_aliases.clone());
         let mut group_key_indices = vec![];
         for col_name in &self.group_by {
-            if let Some(col_idx) = batch.batch.schema.index_of(col_name).ok() {
-                group_key_indices.push(col_idx);
-            } else {
-                anyhow::bail!("Group by column not found: {}", col_name);
+            match resolver.resolve(col_name) {
+                Ok(col_idx) => {
+                    group_key_indices.push(col_idx);
+                }
+                Err(e) => {
+                    anyhow::bail!("Group by column not found: {} ({})", col_name, e);
+                }
             }
         }
         
@@ -1792,12 +2395,22 @@ impl AggregateOperator {
             if agg.column == "*" {
                 eprintln!(" DEBUG: COUNT(*) detected for agg[{}], setting col_idx=usize::MAX", i);
                 agg_col_indices.push(usize::MAX); // Special marker for COUNT(*)
-            } else if let Some(col_idx) = batch.batch.schema.index_of(&agg.column).ok() {
-                eprintln!(" DEBUG: Found column '{}' at index {} for agg[{}]", agg.column, col_idx, i);
-                agg_col_indices.push(col_idx);
             } else {
-                eprintln!(" DEBUG: ERROR - Column '{}' not found for agg[{}]", agg.column, i);
-                anyhow::bail!("Aggregate column not found: {}", agg.column);
+                // Use ColumnResolver for qualified column names (e.g., "e2.salary")
+                use crate::query::column_resolver::ColumnResolver;
+                let resolver = ColumnResolver::new(batch.batch.schema.clone(), self.table_aliases.clone());
+                match resolver.resolve(&agg.column) {
+                    Ok(col_idx) => {
+                        eprintln!(" DEBUG: Found column '{}' at index {} for agg[{}] (using ColumnResolver with aliases)", agg.column, col_idx, i);
+                        agg_col_indices.push(col_idx);
+                    }
+                    Err(e) => {
+                        eprintln!(" DEBUG: ERROR - Column '{}' not found for agg[{}]: {}", agg.column, i, e);
+                        eprintln!(" DEBUG: Available columns: {:?}", resolver.available_columns());
+                        eprintln!(" DEBUG: Table aliases: {:?}", self.table_aliases);
+                        anyhow::bail!("Aggregate column not found: {} ({})", agg.column, e);
+                    }
+                }
             }
         }
 
@@ -1811,8 +2424,15 @@ impl AggregateOperator {
             }
         }
         
-        // Process each row
-        for row_idx in 0..batch.row_count {
+        // Process each row - iterate through ALL rows in the batch (not just row_count)
+        // The selection bitmap indicates which rows to process
+        // The selection bitmap length equals the original batch size before filtering
+        let actual_batch_size = batch.selection.len();
+        eprintln!(" DEBUG: process_batch: actual_batch_size={}, batch.row_count={}, selection.count_ones()={}", 
+            actual_batch_size, batch.row_count, batch.selection.count_ones());
+        
+        for row_idx in 0..actual_batch_size {
+            // Check if this row is selected (respects filtering)
             if !batch.selection[row_idx] {
                 continue;
             }
@@ -1917,10 +2537,18 @@ impl AggregateOperator {
         // Local map: group key (i64) -> aggregate values
         let mut local_groups: FxHashMap<i64, AggregateValues> = FxHashMap::default();
 
-        for row_idx in 0..batch.row_count {
+        // SAFETY: Use batch.selection.len() to avoid array bounds violations
+        let actual_batch_size = batch.selection.len();
+        debug_assert!(actual_batch_size >= batch.row_count, 
+            "batch.selection.len() ({}) >= batch.row_count ({})", 
+            actual_batch_size, batch.row_count);
+        
+        for row_idx in 0..actual_batch_size {
             if !batch.selection[row_idx] {
                 continue;
             }
+            debug_assert!(row_idx < key_array.len(), 
+                "row_idx {} < key_array.len() {}", row_idx, key_array.len());
             if key_array.is_null(row_idx) {
                 continue;
             }
@@ -2102,12 +2730,22 @@ impl BatchIterator for ProjectOperator {
             },
         };
         
+        // WILDCARD EXPANSION: Expand wildcards at runtime if not already expanded
+        // This handles cases where wildcards weren't expanded during planning
+        use crate::query::wildcard_expansion::expand_wildcards_from_schema;
+        let expanded_columns = expand_wildcards_from_schema(
+            &self.columns,
+            &batch.batch.schema,
+            &self.table_aliases,
+        )?;
+        
         // Select only requested columns (zero-copy where possible)
         // Check if columns is empty or contains "*" (wildcard)
-        let is_wildcard = self.columns.is_empty() || 
-            (self.columns.len() == 1 && self.columns[0] == "*");
+        let is_wildcard = expanded_columns.is_empty() || 
+            (expanded_columns.len() == 1 && expanded_columns[0] == "*");
         
-        // eprintln!("ProjectOperator::next: Projecting {} columns: {:?}", self.columns.len(), self.columns);
+        // eprintln!("ProjectOperator::next: Projecting {} columns (expanded from {}): {:?}", 
+        //     expanded_columns.len(), self.columns.len(), expanded_columns);
         let mut output_columns = vec![];
         let mut output_fields = vec![];
         
@@ -2153,87 +2791,112 @@ impl BatchIterator for ProjectOperator {
                                 output_columns.push(batch.batch.column(col_idx).unwrap().clone());
                                 output_fields.push(batch.batch.schema.field(col_idx).clone());
                             }
-                        } else {
-                            // Handle table-qualified column names (e.g., "d.id" or "documents.id")
-                            let resolved_col_name = if col_name.contains('.') {
-                                // Split table.column format
-                                let parts: Vec<&str> = col_name.split('.').collect();
-                                if parts.len() == 2 {
-                                    let table_part = parts[0];
-                                    let col_part = parts[1];
-                                    
-                                    // Resolve table alias to actual table name
-                                    let actual_table = self.table_aliases.get(table_part)
-                                        .map(|s| s.as_str())
-                                        .unwrap_or(table_part);
-                                    
-                                    // Try to find column using different formats:
-                                    // 1. Try "table.column" format first (if schema has prefixed columns)
-                                    // 2. Then try just "column" (for JOIN schemas without prefixes)
-                                    col_part.to_string() // For now, use just column name
-                                } else {
-                                    col_name.clone()
-                                }
-                            } else {
-                                col_name.clone()
-                            };
+                        } else if col_name.ends_with(".*") {
+                            // Qualified wildcard (e.g., "e.*")
+                            let table_alias = col_name.strip_suffix(".*").unwrap();
+                            let mut found_any = false;
                             
-                            // Standard SQL: find column by name (case-insensitive for aggregates)
-                            let col_idx_result = batch.batch.schema.index_of(&resolved_col_name);
-                            let col_idx = if col_idx_result.is_err() {
-                                // Try case-insensitive match (aggregates output uppercase: COUNT, SUM, etc.)
-                                let upper_name = resolved_col_name.to_uppercase();
-                                batch.batch.schema.index_of(&upper_name).or_else(|_| {
-                                    let lower_name = resolved_col_name.to_lowercase();
-                                    batch.batch.schema.index_of(&lower_name)
-                                })
-                            } else {
-                                col_idx_result
-                            };
+                            // Find all columns that match this table alias
+                            for (col_idx, field) in batch.batch.schema.fields().iter().enumerate() {
+                                let field_name = field.name();
+                                // Check if field is qualified with this table alias
+                                if field_name.starts_with(&format!("{}.", table_alias)) {
+                                    output_columns.push(batch.batch.column(col_idx).unwrap().clone());
+                                    output_fields.push(field.as_ref().clone());
+                                    found_any = true;
+                                } else if let Some(actual_table) = self.table_aliases.get(table_alias) {
+                                    // Check if field is qualified with actual table name
+                                    if field_name.starts_with(&format!("{}.", actual_table)) {
+                                        output_columns.push(batch.batch.column(col_idx).unwrap().clone());
+                                        output_fields.push(field.as_ref().clone());
+                                        found_any = true;
+                                    }
+                                }
+                            }
+                            
+                            // Fallback: If no qualified columns found, check if ALL columns are unqualified
+                            // In this case, if this is the only table or the primary table, include all columns
+                            if !found_any {
+                                // Check if all columns in schema are unqualified (no dots)
+                                let all_unqualified = batch.batch.schema.fields().iter()
+                                    .all(|f| !f.name().contains('.'));
+                                
+                                if all_unqualified {
+                                    // All columns are unqualified - likely from a single table
+                                    // Include all columns as a fallback
+                                    for (col_idx, field) in batch.batch.schema.fields().iter().enumerate() {
+                                        output_columns.push(batch.batch.column(col_idx).unwrap().clone());
+                                        output_fields.push(field.as_ref().clone());
+                                        found_any = true;
+                                    }
+                                }
+                            }
+                            
+                            if !found_any {
+                                anyhow::bail!("Qualified wildcard '{}' matched no columns. Available columns: {:?}", 
+                                    col_name,
+                                    batch.batch.schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+                                );
+                            }
+                        } else {
+                            // Use ColumnResolver for robust column resolution
+                            use crate::query::column_resolver::ColumnResolver;
+                            let resolver = ColumnResolver::new(batch.batch.schema.clone(), self.table_aliases.clone());
+                            
+                            let col_idx = resolver.resolve(col_name);
                             
                             match col_idx {
                                 Ok(col_idx) => {
                                     output_columns.push(batch.batch.column(col_idx).unwrap().clone());
-                                    output_fields.push(batch.batch.schema.field(col_idx).clone());
-                                }
-                                Err(_) => {
-                                    // Last resort: fuzzy match for aggregate functions
-                                    let found = (0..batch.batch.schema.fields().len()).find(|&idx| {
-                                        let field_name = batch.batch.schema.field(idx).name();
-                                        // Normalize by removing special chars for comparison
-                                        let norm_field = field_name.to_uppercase().replace(&['(', ')', '*'][..], "");
-                                        let norm_col = resolved_col_name.to_uppercase().replace(&['(', ')', '*'][..], "");
-                                        norm_field == norm_col || 
-                                        field_name.to_uppercase() == resolved_col_name.to_uppercase()
-                                    });
-                                    
-                                    if let Some(col_idx) = found {
-                                        output_columns.push(batch.batch.column(col_idx).unwrap().clone());
-                                        output_fields.push(batch.batch.schema.field(col_idx).clone());
+                                    // EDGE CASE 3 FIX: Use alias if provided, otherwise use original field name
+                                    let original_field = batch.batch.schema.field(col_idx);
+                                    if !expr.alias.is_empty() && expr.alias != *col_name {
+                                        // Alias provided and different from column name - use alias
+                                        output_fields.push(arrow::datatypes::Field::new(
+                                            &expr.alias,
+                                            original_field.data_type().clone(),
+                                            original_field.is_nullable(),
+                                        ));
                                     } else {
-                                        // Standard SQL: column not found is an error
-                                        anyhow::bail!("Column '{}' not found. Available columns: {:?}", 
-                                            col_name,
-                                            batch.batch.schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
-                                        );
+                                        // No alias or alias matches column name - use original field
+                                        output_fields.push(original_field.clone());
                                     }
+                                }
+                                Err(e) => {
+                                    // Standard SQL: column not found is an error
+                                    anyhow::bail!("Column '{}' not found. Available columns: {:?}. Error: {}", 
+                                        col_name,
+                                        batch.batch.schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>(),
+                                        e
+                                    );
                                 }
                             }
                         }
                     }
                     crate::query::plan::ProjectionExprType::Cast { column, target_type } => {
                         // CAST expression - evaluate for each row
-                        let col_idx = batch.batch.schema.index_of(column)
+                        // Use ColumnResolver for consistent column resolution
+                        use crate::query::column_resolver::ColumnResolver;
+                        let resolver = ColumnResolver::new(batch.batch.schema.clone(), self.table_aliases.clone());
+                        let col_idx = resolver.resolve(column)
                             .map_err(|_| anyhow::anyhow!("Column '{}' not found for CAST", column))?;
                         let source_array = batch.batch.column(col_idx).unwrap();
                         
                         // Evaluate CAST for all rows
                         let mut cast_values = Vec::new();
-                        for row_idx in 0..batch.row_count {
+                        // SAFETY: Use batch.selection.len() to avoid array bounds violations
+                        let actual_batch_size = batch.selection.len();
+                        debug_assert!(actual_batch_size >= batch.row_count, 
+                            "batch.selection.len() ({}) >= batch.row_count ({})", 
+                            actual_batch_size, batch.row_count);
+                        
+                        for row_idx in 0..actual_batch_size {
                             if !batch.selection[row_idx] {
                                 cast_values.push(None);
                                 continue;
                             }
+                            debug_assert!(row_idx < source_array.len(), 
+                                "row_idx {} < source_array.len() {}", row_idx, source_array.len());
                             let val = extract_value(source_array, row_idx)?;
                             let cast_val = crate::query::expression::cast_value(&val, target_type)?;
                             cast_values.push(Some(cast_val));
@@ -2325,11 +2988,19 @@ impl BatchIterator for ProjectOperator {
                         
                         // Evaluate CASE expression for all rows
                         let mut case_values = Vec::new();
-                        for row_idx in 0..batch.row_count {
+                        // SAFETY: Use batch.selection.len() to avoid array bounds violations
+                        let actual_batch_size = batch.selection.len();
+                        debug_assert!(actual_batch_size >= batch.row_count, 
+                            "batch.selection.len() ({}) >= batch.row_count ({})", 
+                            actual_batch_size, batch.row_count);
+                        
+                        for row_idx in 0..actual_batch_size {
                             if !batch.selection[row_idx] {
                                 case_values.push(None);
                                 continue;
                             }
+                            debug_assert!(row_idx < batch.batch.row_count, 
+                                "row_idx {} < batch.batch.row_count {}", row_idx, batch.batch.row_count);
                             match evaluator.evaluate(case_expr, &batch, row_idx) {
                                 Ok(val) => case_values.push(Some(val)),
                                 Err(_) => case_values.push(None),
@@ -2376,7 +3047,43 @@ impl BatchIterator for ProjectOperator {
                         output_fields.push(arrow::datatypes::Field::new(&expr.alias, output_type, true));
                     }
                     crate::query::plan::ProjectionExprType::Function(func_expr) => {
-                        // Function expression (e.g., VECTOR_SIMILARITY) - evaluate for each row
+                        // Function expression (e.g., VECTOR_SIMILARITY or aggregate like AVG)
+                        // Check if input batch already has this column (from AggregateOperator)
+                        // If so, just use it directly instead of re-evaluating
+                        // For aggregate functions, check if input batch already has this column
+                        // (from AggregateOperator output). If so, use it directly.
+                        let expected_column_name = &expr.alias;
+                        
+                        // Check if input batch already has a column matching the expected name
+                        let use_existing_column = if !expected_column_name.is_empty() {
+                            // Use ColumnResolver for consistent column resolution
+                            use crate::query::column_resolver::ColumnResolver;
+                            let resolver = ColumnResolver::from_schema(batch.batch.schema.clone());
+                            // Try exact match first
+                            if let Ok(col_idx) = resolver.resolve(expected_column_name) {
+                                // Column exists, check if it has non-null values
+                                if let Some(col) = batch.batch.column(col_idx) {
+                                    // Check if any rows are not NULL
+                                    (0..batch.row_count).any(|i| i < batch.selection.len() && batch.selection[i] && !col.is_null(i))
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        
+                        if use_existing_column {
+                            // Use existing column from input batch (already computed by AggregateOperator)
+                            use crate::query::column_resolver::ColumnResolver;
+                            let resolver = ColumnResolver::from_schema(batch.batch.schema.clone());
+                            let col_idx = resolver.resolve(expected_column_name).unwrap();
+                            output_columns.push(batch.batch.column(col_idx).unwrap().clone());
+                            output_fields.push(batch.batch.schema.field(col_idx).clone());
+                        } else {
+                            // Otherwise, evaluate function expression for each row
                         use crate::query::expression::ExpressionEvaluator;
                         let evaluator = if let Some(ref executor) = self.subquery_executor {
                             ExpressionEvaluator::with_subquery_executor_and_aliases(
@@ -2393,8 +3100,13 @@ impl BatchIterator for ProjectOperator {
                         
                         // Evaluate function expression for all rows
                         let mut func_values = Vec::new();
-                        for row_idx in 0..batch.row_count {
-                            if !batch.selection[row_idx] {
+                        // SAFETY: Iterate only up to batch.batch.row_count to avoid array bounds violations
+                        // The selection bitmap may be larger, but we only process rows that exist in the batch
+                        let max_rows = batch.batch.row_count;
+                        
+                        for row_idx in 0..max_rows {
+                            // Check if row is selected (and within selection bitmap bounds)
+                            if row_idx >= batch.selection.len() || !batch.selection[row_idx] {
                                 func_values.push(None);
                                 continue;
                             }
@@ -2460,16 +3172,17 @@ impl BatchIterator for ProjectOperator {
                             }
                         };
                         
-                        // Determine output type from array
-                        let output_type = func_array.data_type().clone();
-                        output_columns.push(func_array);
-                        output_fields.push(arrow::datatypes::Field::new(&expr.alias, output_type, true));
+                            // Determine output type from array
+                            let output_type = func_array.data_type().clone();
+                            output_columns.push(func_array);
+                            output_fields.push(arrow::datatypes::Field::new(&expr.alias, output_type, true));
+                        }
                     }
                 }
             }
         } else {
             // Fall back to column name-based projection (standard SQL behavior)
-            for col_name in &self.columns {
+            for col_name in &expanded_columns {
                 if col_name == "*" {
                     // Add all columns
                     for col_idx in 0..batch.batch.columns.len() {
@@ -2499,22 +3212,11 @@ impl BatchIterator for ProjectOperator {
                         col_name.clone()
                     };
                     
-                    // Try exact match first
-                    let col_idx_result = batch.batch.schema.index_of(&resolved_col_name);
-                    // Then try case-insensitive match (for aggregate functions like COUNT)
-                    let col_idx = if col_idx_result.is_err() {
-                        // Try uppercase version (aggregates output uppercase names)
-                        let upper_name = resolved_col_name.to_uppercase();
-                        batch.batch.schema.index_of(&upper_name).or_else(|_| {
-                            // Try lowercase version
-                            let lower_name = resolved_col_name.to_lowercase();
-                            batch.batch.schema.index_of(&lower_name)
-                        })
-                    } else {
-                        col_idx_result
-                    };
+                    // Use ColumnResolver for consistent column resolution
+                    use crate::query::column_resolver::ColumnResolver;
+                    let resolver = ColumnResolver::new(batch.batch.schema.clone(), self.table_aliases.clone());
                     
-                    match col_idx {
+                    match resolver.resolve(&resolved_col_name) {
                         Ok(col_idx) => {
                             output_columns.push(batch.batch.column(col_idx).unwrap().clone());
                             output_fields.push(batch.batch.schema.field(col_idx).clone());
@@ -2544,22 +3246,26 @@ impl BatchIterator for ProjectOperator {
                                     resolved_col_name.clone()
                                 };
                                 
-                                let final_attempt = batch.batch.schema.index_of(&col_without_prefix);
-                                if let Ok(col_idx) = final_attempt {
-                                    output_columns.push(batch.batch.column(col_idx).unwrap().clone());
-                                    output_fields.push(batch.batch.schema.field(col_idx).clone());
-                                } else {
-                                    // Column not found - this is an error in standard SQL
-                                    eprintln!("DEBUG ProjectOperator: Column '{}' (resolved: '{}', without prefix: '{}') not found in schema. Available columns: {:?}", 
-                                        col_name,
-                                        resolved_col_name,
-                                        col_without_prefix,
-                                        batch.batch.schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
-                                    );
-                                    anyhow::bail!("Column '{}' not found. Available columns: {:?}", 
-                                        col_name,
-                                        batch.batch.schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
-                                    );
+                                // Final attempt: use ColumnResolver to resolve unqualified name
+                                let final_resolver = ColumnResolver::new(batch.batch.schema.clone(), self.table_aliases.clone());
+                                match final_resolver.resolve(&col_without_prefix) {
+                                    Ok(col_idx) => {
+                                        output_columns.push(batch.batch.column(col_idx).unwrap().clone());
+                                        output_fields.push(batch.batch.schema.field(col_idx).clone());
+                                    }
+                                    Err(_) => {
+                                        // Column not found - this is an error in standard SQL
+                                        eprintln!("DEBUG ProjectOperator: Column '{}' (resolved: '{}', without prefix: '{}') not found in schema. Available columns: {:?}", 
+                                            col_name,
+                                            resolved_col_name,
+                                            col_without_prefix,
+                                            batch.batch.schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+                                        );
+                                        anyhow::bail!("Column '{}' not found. Available columns: {:?}", 
+                                            col_name,
+                                            batch.batch.schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -2587,42 +3293,92 @@ impl BatchIterator for ProjectOperator {
     }
     
     fn schema(&self) -> SchemaRef {
+        // SCHEMA-FLOW: ProjectOperator selects columns from input schema dynamically
         // Build schema with only requested columns
-        if self.columns.is_empty() {
-            return self.input.schema();
-        }
         
+        // Get input schema dynamically (always current)
         let input_schema = self.input.schema();
+        
+        // SCHEMA-FLOW DEBUG: Log input schema
+        eprintln!("DEBUG ProjectOperator::schema() - Input schema has {} fields: {:?}", 
+            input_schema.fields().len(),
+            input_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+        
+        // Use ColumnResolver for consistent column resolution in schema() method
+        // This ensures schema() matches next() behavior exactly
+        use crate::query::column_resolver::ColumnResolver;
+        let resolver = ColumnResolver::new(input_schema.clone(), self.table_aliases.clone());
+        
         let mut fields = vec![];
         
-        // Debug: log available columns in input schema
-        let available_columns: Vec<String> = input_schema.fields().iter().map(|f| f.name().to_string()).collect();
-        
-        for col_name in &self.columns {
-            // Handle table-qualified column names (e.g., "c.full_name" -> "full_name")
-            let resolved_col_name = if col_name.contains('.') {
-                let parts: Vec<&str> = col_name.split('.').collect();
-                if parts.len() == 2 {
-                    parts[1].to_string() // Use just column name
-                } else {
-                    col_name.clone()
+        // EDGE CASE 3 FIX: Process expressions to handle aliases correctly (matches next() logic)
+        if !self.expressions.is_empty() {
+            for expr in &self.expressions {
+                match &expr.expr_type {
+                    crate::query::plan::ProjectionExprType::Column(col_name) => {
+                        // Use ColumnResolver for consistent column resolution
+                        match resolver.resolve(col_name) {
+                            Ok(idx) => {
+                                let original_field = input_schema.field(idx);
+                                // EDGE CASE 3 FIX: Use alias if provided, otherwise use original field name
+                                if !expr.alias.is_empty() && expr.alias != col_name.as_str() {
+                                    fields.push(arrow::datatypes::Field::new(
+                                        &expr.alias,
+                                        original_field.data_type().clone(),
+                                        original_field.is_nullable(),
+                                    ));
+                                } else {
+                                    fields.push(original_field.clone());
+                                }
+                            }
+                            Err(_) => {
+                                // Column not found - this will fail in next() with a better error message
+                                eprintln!("DEBUG ProjectOperator::schema() - Column '{}' not found. Available columns: {:?}", 
+                                    col_name,
+                                    input_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+                                // Don't add to fields - will fail in next() with clearer error
+                            }
+                        }
+                    }
+                    crate::query::plan::ProjectionExprType::Cast { target_type, .. } => {
+                        // CAST expression - use alias if provided, otherwise use column name
+                        let field_name = if !expr.alias.is_empty() { &expr.alias } else { "cast_result" };
+                        fields.push(arrow::datatypes::Field::new(field_name, target_type.clone(), true));
+                    }
+                    crate::query::plan::ProjectionExprType::Case(_) => {
+                        // CASE expression - use alias if provided
+                        let field_name = if !expr.alias.is_empty() { &expr.alias } else { "case_result" };
+                        // Infer type from first non-null value (simplified - actual type inference in next())
+                        fields.push(arrow::datatypes::Field::new(field_name, arrow::datatypes::DataType::Utf8, true));
+                    }
+                    crate::query::plan::ProjectionExprType::Function(_) => {
+                        // Function expression - use alias if provided
+                        let field_name = if !expr.alias.is_empty() { &expr.alias } else { "func_result" };
+                        // Infer type from function (simplified - actual type inference in next())
+                        fields.push(arrow::datatypes::Field::new(field_name, arrow::datatypes::DataType::Float64, true));
+                    }
                 }
-            } else {
-                col_name.clone()
-            };
-            
-            // Try exact match first
-            if let Ok(idx) = input_schema.index_of(&resolved_col_name) {
-                fields.push(input_schema.field(idx).clone());
-            } else {
-                // Try case-insensitive match
-                let found_idx = input_schema.fields().iter().position(|f| {
-                    f.name().eq_ignore_ascii_case(&resolved_col_name)
-                });
-                if let Some(idx) = found_idx {
-                    fields.push(input_schema.field(idx).clone());
+            }
+        } else if self.columns.is_empty() || (self.columns.len() == 1 && self.columns[0] == "*") {
+            // Wildcard: return input schema unchanged
+            eprintln!("DEBUG ProjectOperator::schema() - Wildcard projection, returning input schema");
+            return input_schema;
+        } else {
+            // Fallback: use columns list (legacy path - no expressions, no aliases)
+            for col_name in &self.columns {
+                // Use ColumnResolver for consistent column resolution
+                match resolver.resolve(col_name) {
+                    Ok(idx) => {
+                        fields.push(input_schema.field(idx).clone());
+                    }
+                    Err(_) => {
+                        // Column not found - this will fail in next() with a better error message
+                        eprintln!("DEBUG ProjectOperator::schema() - Column '{}' not found. Available columns: {:?}", 
+                            col_name,
+                            input_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+                        // Don't add to fields - will fail in next() with clearer error
+                    }
                 }
-                // If still not found, it will fail in next() with a better error message
             }
         }
         
@@ -2639,6 +3395,8 @@ pub struct SortOperator {
     buffered_rows: Vec<ExecutionBatch>,
     /// Whether we've already buffered and processed all input
     input_buffered: bool,
+    /// Table alias mapping: alias -> actual table name (e.g., "e1" -> "employees")
+    table_aliases: std::collections::HashMap<String, String>,
 }
 
 impl SortOperator {
@@ -2655,6 +3413,25 @@ impl SortOperator {
             offset,
             buffered_rows: vec![],
             input_buffered: false,
+            table_aliases: std::collections::HashMap::new(),
+        }
+    }
+    
+    pub fn with_table_aliases(
+        input: Box<dyn BatchIterator>,
+        order_by: Vec<OrderByExpr>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        table_aliases: std::collections::HashMap<String, String>,
+    ) -> Self {
+        Self {
+            input,
+            order_by,
+            limit,
+            offset,
+            buffered_rows: vec![],
+            input_buffered: false,
+            table_aliases,
         }
     }
 }
@@ -2714,39 +3491,59 @@ impl BatchIterator for SortOperator {
                 eprintln!(" DEBUG: buffered_rows[0].schema fields: {:?}", 
                     first_batch.batch.schema.fields().iter().map(|f| format!("{}:{:?}", f.name(), f.data_type())).collect::<Vec<_>>());
                 
-                // Extract sort key columns (match by name, case-insensitive, including aliases)
+                // Extract sort key columns using ColumnResolver for unified resolution
+                use crate::query::column_resolver::ColumnResolver;
+                let resolver = ColumnResolver::new(schema.clone(), self.table_aliases.clone());
+                
                 let mut sort_key_indices = vec![];
                 for order_expr in &self.order_by {
-                    // Try exact match first
-                    let col_idx = schema.index_of(&order_expr.column)
-                        // Try case-insensitive match
-                        .or_else(|_| {
-                            let upper = order_expr.column.to_uppercase();
-                            schema.index_of(&upper)
-                        })
-                        // Try lowercase match
-                        .or_else(|_| {
-                            let lower = order_expr.column.to_lowercase();
-                            schema.index_of(&lower)
-                        })
-                        // Try fuzzy match (for aggregate function names vs aliases)
-                        .or_else(|_| {
-                            // Find column by partial match
-                            (0..schema.fields().len()).find(|&idx| {
-                                let field_name = schema.field(idx).name();
-                                field_name.to_uppercase() == order_expr.column.to_uppercase() ||
-                                field_name.to_uppercase().contains(&order_expr.column.to_uppercase()) ||
-                                order_expr.column.to_uppercase().contains(&field_name.to_uppercase())
-                            }).ok_or_else(|| {
-                                anyhow::anyhow!("Column '{}' not found in schema", order_expr.column)
-                            })
-                        });
+                    // Use ColumnResolver for consistent column resolution with table aliases
+                    let col_idx = resolver.resolve(&order_expr.column);
                     
                     match col_idx {
                         Ok(idx) => {
                             sort_key_indices.push((idx, order_expr.ascending));
                         }
                         Err(_) => {
+                            // EDGE CASE 1 FIX: Try multiple resolution strategies
+                            // Strategy 1: Try exact match (case-insensitive) in schema
+                            let order_col_upper = order_expr.column.to_uppercase();
+                            if let Some(idx) = schema.fields().iter().position(|f| {
+                                f.name().to_uppercase() == order_col_upper
+                            }) {
+                                sort_key_indices.push((idx, order_expr.ascending));
+                                continue;
+                            }
+                            
+                            // Strategy 2: If ORDER BY uses qualified name (e.g., "e1.salary"), 
+                            // try to find unqualified part ("salary") or check for aliases
+                            let unqualified_name = if order_expr.column.contains('.') {
+                                order_expr.column.split('.').last().unwrap_or(&order_expr.column)
+                            } else {
+                                &order_expr.column
+                            };
+                            
+                            // Try to find column by unqualified name
+                            if let Some(idx) = schema.fields().iter().position(|f| {
+                                let field_name = f.name();
+                                field_name.to_uppercase() == unqualified_name.to_uppercase() ||
+                                field_name.ends_with(&format!(".{}", unqualified_name))
+                            }) {
+                                sort_key_indices.push((idx, order_expr.ascending));
+                                continue;
+                            }
+                            
+                            // Strategy 3: Check if any column name contains the ORDER BY column name
+                            // This handles cases where ORDER BY uses "e1.salary" but schema has "emp_salary"
+                            if let Some(idx) = schema.fields().iter().position(|f| {
+                                let field_name = f.name().to_uppercase();
+                                field_name.contains(&unqualified_name.to_uppercase()) ||
+                                unqualified_name.to_uppercase() == field_name.split('.').last().unwrap_or("").to_uppercase()
+                            }) {
+                                sort_key_indices.push((idx, order_expr.ascending));
+                                continue;
+                            }
+                            
                             // WORKAROUND: If ORDER BY is "COUNT" but we have "total" or "total_value", 
                             // this is likely a parser bug. Try common alias patterns.
                             let order_upper = order_expr.column.to_uppercase();
@@ -2937,19 +3734,46 @@ impl BatchIterator for SortOperator {
                     }
                 }
                 
-                // Collect all rows
+                // Collect all rows - respect selection bitmap
                 for batch in &self.buffered_rows {
-                    for row_idx in 0..batch.row_count {
-                        if batch.selection[row_idx] {
-                            let mut row = vec![];
-                            for col_idx in 0..batch.batch.columns.len() {
-                                let col = batch.batch.column(col_idx).unwrap();
+                    // Iterate through ALL rows in the batch (not just row_count)
+                    // The selection bitmap indicates which rows to include
+                    let actual_batch_size = batch.selection.len();
+                    eprintln!(" DEBUG: SortOperator collecting rows: actual_batch_size={}, batch.row_count={}, selection.count_ones()={}", 
+                        actual_batch_size, batch.row_count, batch.selection.count_ones());
+                    
+                    // SAFETY: Iterate only up to the minimum of selection.len() and actual array length
+                    let max_row_idx = batch.batch.columns.first()
+                        .map(|col| col.len())
+                        .unwrap_or(actual_batch_size);
+                    let safe_batch_size = actual_batch_size.min(max_row_idx);
+                    
+                    for row_idx in 0..safe_batch_size {
+                        // Only include rows that are selected (respects filtering)
+                        if row_idx >= batch.selection.len() || !batch.selection[row_idx] {
+                            continue;
+                        }
+                        
+                        let mut row = vec![];
+                        for col_idx in 0..batch.batch.columns.len() {
+                            let col = batch.batch.column(col_idx).unwrap();
+                            // Ensure row_idx is within array bounds
+                            if row_idx < col.len() {
                                 row.push(extract_value(col, row_idx)?);
+                            } else {
+                                // Array is shorter than expected - skip this row
+                                break;
                             }
+                        }
+                        // Only add row if we successfully extracted all column values
+                        if row.len() == batch.batch.columns.len() {
                             all_rows.push(row);
                         }
                     }
                 }
+                
+                eprintln!(" DEBUG: SortOperator collected {} rows from {} batches", 
+                    all_rows.len(), self.buffered_rows.len());
                 
                 // Sort rows
                 all_rows.sort_by(|a, b| {
@@ -3090,7 +3914,15 @@ impl BatchIterator for SortOperator {
     }
     
     fn schema(&self) -> SchemaRef {
-        self.input.schema()
+        // SCHEMA-FLOW: SortOperator passes through input schema unchanged
+        let input_schema = self.input.schema();
+        
+        // SCHEMA-FLOW DEBUG: Log schema propagation
+        eprintln!("DEBUG SortOperator::schema() - Passing through input schema with {} fields: {:?}", 
+            input_schema.fields().len(),
+            input_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+        
+        input_schema
     }
 }
 
@@ -3102,8 +3934,6 @@ pub struct DistinctOperator {
     seen_rows: std::collections::HashSet<Vec<Value>>,
     /// Buffered unique rows waiting to be output
     output_buffer: Vec<Vec<Value>>,
-    /// Schema for creating output batches
-    schema: SchemaRef,
     /// Whether we've finished consuming input
     input_exhausted: bool,
     /// Batch size for output
@@ -3112,12 +3942,11 @@ pub struct DistinctOperator {
 
 impl DistinctOperator {
     pub fn new(input: Box<dyn BatchIterator>) -> Self {
-        let schema = input.schema();
+        // NO schema snapshot - compute dynamically from input when needed
         Self {
             input,
             seen_rows: std::collections::HashSet::new(),
             output_buffer: Vec::new(),
-            schema,
             input_exhausted: false,
             batch_size: 8192, // Output in batches of 8K rows
         }
@@ -3222,7 +4051,8 @@ impl BatchIterator for DistinctOperator {
         if !self.output_buffer.is_empty() {
             let batch_size = self.batch_size.min(self.output_buffer.len());
             let batch_rows = self.output_buffer.drain(..batch_size).collect::<Vec<_>>();
-            return Ok(Some(self.values_to_batch(&batch_rows, &self.schema)?));
+            // Compute schema dynamically from input operator
+            return Ok(Some(self.values_to_batch(&batch_rows, &self.input.schema())?));
         }
         
         // If buffer is empty and input is exhausted, we're done
@@ -3235,11 +4065,20 @@ impl BatchIterator for DistinctOperator {
             match self.input.next()? {
                 Some(batch) => {
                     // Process each row in the batch
-                    for row_idx in 0..batch.row_count {
+                    // SAFETY: Use batch.selection.len() to avoid array bounds violations
+                    let actual_batch_size = batch.selection.len();
+                    debug_assert!(actual_batch_size >= batch.row_count, 
+                        "batch.selection.len() ({}) >= batch.row_count ({})", 
+                        actual_batch_size, batch.row_count);
+                    
+                    for row_idx in 0..actual_batch_size {
                         // Only process selected rows
                         if !batch.selection[row_idx] {
                             continue;
                         }
+                        
+                        debug_assert!(row_idx < batch.batch.row_count, 
+                            "row_idx {} < batch.batch.row_count {}", row_idx, batch.batch.row_count);
                         
                         // Extract row values
                         let row = Self::extract_row(&batch, row_idx)?;
@@ -3253,7 +4092,8 @@ impl BatchIterator for DistinctOperator {
                             // If buffer is full, output a batch
                             if self.output_buffer.len() >= self.batch_size {
                                 let batch_rows = self.output_buffer.drain(..self.batch_size).collect::<Vec<_>>();
-                                return Ok(Some(self.values_to_batch(&batch_rows, &self.schema)?));
+                                // Compute schema dynamically from input operator
+            return Ok(Some(self.values_to_batch(&batch_rows, &self.input.schema())?));
                             }
                         }
                     }
@@ -3265,7 +4105,8 @@ impl BatchIterator for DistinctOperator {
                     // Output remaining buffer if any
                     if !self.output_buffer.is_empty() {
                         let batch_rows = self.output_buffer.drain(..).collect::<Vec<_>>();
-                        return Ok(Some(self.values_to_batch(&batch_rows, &self.schema)?));
+                        // Compute schema dynamically from input operator
+            return Ok(Some(self.values_to_batch(&batch_rows, &self.input.schema())?));
                     }
                     
                     return Ok(None);
@@ -3275,7 +4116,8 @@ impl BatchIterator for DistinctOperator {
     }
     
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        // Compute schema dynamically from input operator (never use stale snapshot)
+        self.input.schema()
     }
 }
 
@@ -3388,6 +4230,9 @@ pub fn build_operator_with_subquery_executor(
     subquery_executor: Option<std::sync::Arc<dyn crate::query::expression::SubqueryExecutor>>,
     table_aliases: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<Box<dyn BatchIterator>> {
+    eprintln!("DEBUG build_operator_with_subquery_executor: subquery_executor.is_some()={}, operator={:?}", 
+        subquery_executor.is_some(), 
+        std::mem::discriminant(plan_op));
     let table_aliases = table_aliases.cloned().unwrap_or_default();
     match plan_op {
         PlanOperator::CTEScan { cte_name, columns, limit, offset } => {
@@ -3449,10 +4294,10 @@ pub fn build_operator_with_subquery_executor(
                 scan_op.fragment_predicates = fragment_preds;
                 
                 let input_op: Box<dyn BatchIterator> = Box::new(scan_op);
-                Ok(Box::new(FilterOperator::new(input_op, predicates.clone())))
+                Ok(Box::new(FilterOperator::with_subquery_executor_and_aliases(input_op, predicates.clone(), subquery_executor.clone(), table_aliases.clone())))
             } else {
                 let input_op = build_operator_with_subquery_executor(input, graph.clone(), max_scan_rows, cte_results, subquery_executor.clone(), Some(&table_aliases))?;
-                Ok(Box::new(FilterOperator::new(input_op, predicates.clone())))
+                Ok(Box::new(FilterOperator::with_subquery_executor_and_aliases(input_op, predicates.clone(), subquery_executor.clone(), table_aliases.clone())))
             }
         }
         PlanOperator::Join { left, right, edge_id, join_type, predicate } => {
@@ -3481,7 +4326,12 @@ pub fn build_operator_with_subquery_executor(
         PlanOperator::Window { input, window_functions } => {
             let input_op = build_operator_with_subquery_executor(input, graph.clone(), max_scan_rows, cte_results, subquery_executor.clone(), Some(&table_aliases))?;
             use crate::execution::window::WindowOperator;
-            Ok(Box::new(WindowOperator::new(input_op, window_functions.clone())))
+            // Create WindowOperator with table aliases for proper column resolution
+            Ok(Box::new(WindowOperator::with_table_aliases(
+                input_op, 
+                window_functions.clone(),
+                table_aliases.clone()
+            )))
         }
         PlanOperator::Project { input, columns, expressions } => {
             let input_op = build_operator_with_subquery_executor(input, graph.clone(), max_scan_rows, cte_results, subquery_executor.clone(), Some(&table_aliases))?;
@@ -3495,11 +4345,12 @@ pub fn build_operator_with_subquery_executor(
         }
         PlanOperator::Sort { input, order_by, limit, offset } => {
             let input_op = build_operator_with_subquery_executor(input, graph.clone(), max_scan_rows, cte_results, subquery_executor.clone(), Some(&table_aliases))?;
-            Ok(Box::new(SortOperator::new(
+            Ok(Box::new(SortOperator::with_table_aliases(
                 input_op,
                 order_by.clone(),
                 *limit,
                 *offset,
+                table_aliases.clone(),
             )))
         }
         PlanOperator::Limit { input, limit, offset } => {

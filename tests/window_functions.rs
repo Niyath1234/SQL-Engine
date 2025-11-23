@@ -87,6 +87,7 @@ fn test_window_function_parsing_infrastructure() {
         offset: None,
         projection_expressions: vec![],
         distinct: false,
+        table_aliases: std::collections::HashMap::new(),
     };
     
     // Verify window_functions field exists and is empty

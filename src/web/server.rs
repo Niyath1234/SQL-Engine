@@ -26,6 +26,7 @@ pub async fn start_server(engine: HypergraphSQLEngine, port: u16) -> Result<(), 
         .route("/api/table/:name", get(get_table_info))
         .route("/api/stats", get(get_stats))
         .route("/api/load_csv", post(load_csv))
+        .route("/api/clear_cache", post(clear_cache))
         .layer(CorsLayer::permissive())
         .with_state(state);
     
@@ -632,5 +633,84 @@ fn load_csv_file(path: &str) -> Result<(usize, Vec<String>, Vec<(String, crate::
     }
     
     Ok((rows.len(), column_names, column_fragments, rows))
+}
+
+/// Clear cache and program-created files
+#[derive(Serialize)]
+struct ClearCacheResponse {
+    success: bool,
+    message: String,
+    cleared_items: Vec<String>,
+    error: Option<String>,
+}
+
+async fn clear_cache() -> Result<Json<ClearCacheResponse>, StatusCode> {
+    use std::fs;
+    use std::path::Path;
+    
+    let mut cleared_items = Vec::new();
+    let mut errors = Vec::new();
+    
+    // Clear .query_patterns/ directory
+    let query_patterns_dir = Path::new(".query_patterns");
+    if query_patterns_dir.exists() {
+        match fs::remove_dir_all(query_patterns_dir) {
+            Ok(_) => {
+                cleared_items.push(".query_patterns/ (pattern learning database)".to_string());
+            }
+            Err(e) => {
+                errors.push(format!("Failed to remove .query_patterns/: {}", e));
+            }
+        }
+    }
+    
+    // Clear .wal/ directory (transaction logs)
+    let wal_dir = Path::new(".wal");
+    if wal_dir.exists() {
+        match fs::remove_dir_all(wal_dir) {
+            Ok(_) => {
+                cleared_items.push(".wal/ (transaction logs)".to_string());
+            }
+            Err(e) => {
+                errors.push(format!("Failed to remove .wal/: {}", e));
+            }
+        }
+    }
+    
+    // Clear log files
+    let log_files = vec![".wal.log", "wal.log"];
+    for log_file in log_files {
+        let log_path = Path::new(log_file);
+        if log_path.exists() {
+            match fs::remove_file(log_path) {
+                Ok(_) => {
+                    cleared_items.push(format!("{} (log file)", log_file));
+                }
+                Err(e) => {
+                    errors.push(format!("Failed to remove {}: {}", log_file, e));
+                }
+            }
+        }
+    }
+    
+    if errors.is_empty() {
+        Ok(Json(ClearCacheResponse {
+            success: true,
+            message: if cleared_items.is_empty() {
+                "No cache files to clear".to_string()
+            } else {
+                format!("Successfully cleared {} item(s)", cleared_items.len())
+            },
+            cleared_items,
+            error: None,
+        }))
+    } else {
+        Ok(Json(ClearCacheResponse {
+            success: false,
+            message: format!("Partially cleared. {} error(s) occurred", errors.len()),
+            cleared_items,
+            error: Some(errors.join("; ")),
+        }))
+    }
 }
 

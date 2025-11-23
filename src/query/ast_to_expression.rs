@@ -135,6 +135,35 @@ pub fn sql_expr_to_expression(expr: &Expr) -> Result<Expression> {
                 args,
             })
         }
+        Expr::Subquery(query) => {
+            // Convert subquery to Expression::Subquery
+            Ok(Expression::Subquery(query.clone()))
+        }
+        Expr::Exists { subquery, negated } => {
+            // Convert EXISTS subquery
+            let subquery_expr = Expression::Exists(subquery.clone());
+            if *negated {
+                Ok(Expression::UnaryOp {
+                    op: UnaryOperator::Not,
+                    expr: Box::new(subquery_expr),
+                })
+            } else {
+                Ok(subquery_expr)
+            }
+        }
+        Expr::InSubquery { expr: _, subquery, negated } => {
+            // IN subquery - for now, convert to EXISTS for simplicity
+            // TODO: Properly implement IN subquery
+            let exists_expr = Expression::Exists(subquery.clone());
+            if *negated {
+                Ok(Expression::UnaryOp {
+                    op: UnaryOperator::Not,
+                    expr: Box::new(exists_expr),
+                })
+            } else {
+                Ok(exists_expr)
+            }
+        }
         _ => anyhow::bail!("Unsupported expression type: {:?}", expr)
     }
 }

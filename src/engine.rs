@@ -58,6 +58,8 @@ pub struct HypergraphSQLEngine {
     transaction_manager: Arc<crate::execution::transaction::TransactionManager>,
     /// Current active transaction ID (None if no transaction)
     current_transaction: Option<u64>,
+    /// Query pattern learner (learns from query execution)
+    pattern_learner: Arc<std::sync::Mutex<crate::learning::pattern_learner::QueryPatternLearner>>,
 }
 
 impl HypergraphSQLEngine {
@@ -98,6 +100,19 @@ impl HypergraphSQLEngine {
                 .unwrap_or_else(|_| crate::execution::transaction::TransactionManager::new())
         );
         
+        // Initialize query pattern learner
+        let graph_clone = graph.clone();
+        let learner_dir = std::path::PathBuf::from(".query_patterns");
+        let pattern_learner = Arc::new(
+            std::sync::Mutex::new(
+                crate::learning::pattern_learner::QueryPatternLearner::new(graph_clone, learner_dir)
+                    .unwrap_or_else(|e| {
+                        eprintln!("Warning: Failed to initialize pattern learner: {}", e);
+                        crate::learning::pattern_learner::QueryPatternLearner::dummy()
+                    })
+            )
+        );
+        
         Self {
             graph,
             planner,
@@ -117,6 +132,7 @@ impl HypergraphSQLEngine {
             session_working_set,
             transaction_manager,
             current_transaction: None,
+            pattern_learner,
         }
     }
     
@@ -177,7 +193,19 @@ impl HypergraphSQLEngine {
             return self.execute_describe_table(&table_name);
         }
         
-        // Parse SQL to determine statement type
+        // Handle multi-statement SQL (statements separated by semicolons)
+        // Transaction statements (BEGIN/COMMIT/ROLLBACK) can span multiple statements
+        let statements: Vec<&str> = sql.split(';')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        
+        // If we have multiple statements, execute them in sequence within a transaction context
+        if statements.len() > 1 {
+            return self.execute_multi_statement_transaction(&statements);
+        }
+        
+        // Single statement - parse and execute normally
         let ast = parse_sql(sql).map_err(|e| {
             // Provide helpful error messages for common syntax errors
             let error_msg = e.to_string().to_lowercase();
@@ -236,6 +264,18 @@ impl HypergraphSQLEngine {
                 let table_name = extract_drop_table(&ast)?;
                 self.execute_drop_table(&table_name)
             }
+            sqlparser::ast::Statement::StartTransaction { .. } => {
+                // BEGIN TRANSACTION statement
+                self.execute_begin_transaction()
+            }
+            sqlparser::ast::Statement::Commit { .. } => {
+                // COMMIT TRANSACTION statement
+                self.execute_commit_transaction()
+            }
+            sqlparser::ast::Statement::Rollback { .. } => {
+                // ROLLBACK TRANSACTION statement
+                self.execute_rollback_transaction()
+            }
             _ => anyhow::bail!("Unsupported statement type: {:?}", ast),
         }
     }
@@ -261,13 +301,91 @@ impl HypergraphSQLEngine {
             }
         }
         
+        // ========================================================================
+        // TWO-PHASE EXECUTION PLAN FOR CTEs (Option 1: Robust Architecture Fix)
+        // ========================================================================
+        // Phase 1: Parse and Analyze - Identify CTE definitions and references
+        // Phase 2: Materialize CTEs - Execute all CTEs and cache results
+        // Phase 3: Execute Main Query - Build plan and execute with CTE results available
+        // ========================================================================
+        
+        // Phase 1: Parse SQL and extract CTE context
+        let ast = parse_sql(sql)?;
+        
+        // Extract CTE definitions if present (Phase 1: Analysis)
+        let (cte_context, cte_results) = if let sqlparser::ast::Statement::Query(query) = &ast {
+            eprintln!("DEBUG engine::execute_query: Checking for WITH clause, query.with is: {:?}", query.with.is_some());
+            if let Some(with) = &query.with {
+                eprintln!("DEBUG engine::execute_query: WITH clause found, CTEs: {:?}", with.cte_tables.iter().map(|cte| &cte.alias.name).collect::<Vec<_>>());
+                let cte_ctx = crate::query::cte::CTEContext::from_query(query)?;
+                
+                // Phase 2: Materialize all CTEs - Execute each CTE and cache results
+                // This happens BEFORE plan building, ensuring results are always available
+                let mut cte_result_cache = std::collections::HashMap::new();
+                let planner = QueryPlanner::from_arc(self.graph.clone());
+                
+                eprintln!("DEBUG engine::execute_query: Phase 2 - Materializing {} CTEs", cte_ctx.names().len());
+                for cte_name in cte_ctx.names() {
+                    if let Some(cte_def) = cte_ctx.get(&cte_name) {
+                        eprintln!("DEBUG engine::execute_query: Materializing CTE '{}'", cte_name);
+                        // EDGE CASE 2 FIX: Pass CTE context and previously materialized CTEs to nested CTE execution
+                        // This allows nested CTEs (e.g., high_avg_depts) to reference earlier CTEs (e.g., dept_stats)
+                        // The CTE context tells the planner which names are CTEs, and CTE results provide the data
+                        let cte_result = self.execution_engine.execute_subquery_ast(
+                            &cte_def.query,
+                            &planner,
+                            Some(&cte_ctx), // Pass CTE context so planner knows which names are CTEs
+                            Some(&cte_result_cache), // Pass accumulated CTE results for data access
+                        )?;
+                        
+                        eprintln!("DEBUG engine::execute_query: CTE '{}' materialized: {} batches, {} total rows", 
+                            cte_name, cte_result.batches.len(), cte_result.row_count);
+                        
+                        // Cache the result - store with BOTH plain name and __CTE_ prefix for operator lookup
+                        let batches_clone = cte_result.batches.clone();
+                        cte_result_cache.insert(cte_name.clone(), cte_result.batches);
+                        // Also store with __CTE_ prefix (CTEScan operator looks for both)
+                        cte_result_cache.insert(format!("__CTE_{}", cte_name), batches_clone);
+                        eprintln!("DEBUG engine::execute_query: Cached CTE '{}' with keys: '{}' and '__CTE_{}'", 
+                            cte_name, cte_name, cte_name);
+                    }
+                }
+                eprintln!("DEBUG engine::execute_query: Phase 2 complete - {} CTEs materialized", cte_result_cache.len() / 2); // Divide by 2 because we store each CTE twice
+                
+                (Some(cte_ctx), cte_result_cache)
+            } else {
+                (None, std::collections::HashMap::new())
+            }
+        } else {
+            (None, std::collections::HashMap::new())
+        };
+        
+        // Store CTE results in materialized_views (temporary storage for CTE results)
+        eprintln!("DEBUG engine::execute_query: CTE results computed: {} CTEs found", cte_results.len());
+        for (cte_name, cte_batches) in &cte_results {
+            eprintln!("DEBUG engine::execute_query: Storing CTE '{}' with {} batches ({} total rows)", 
+                cte_name, cte_batches.len(), cte_batches.iter().map(|b| b.row_count).sum::<usize>());
+            // Store in materialized_views with __CTE_ prefix (for future reference)
+            if !cte_name.starts_with("__CTE_") {
+                self.materialized_views.insert(format!("__CTE_{}", cte_name), cte_batches.clone());
+            }
+        }
+        
+        // Verify cte_results keys for debugging
+        if !cte_results.is_empty() {
+            eprintln!("DEBUG engine::execute_query: cte_results keys that will be passed to execution: {:?}", 
+                cte_results.keys().collect::<Vec<_>>());
+        }
+        
         // 2. Check plan cache
         let plan = if let Some(cached_plan) = self.plan_cache.get(&signature) {
+            eprintln!("DEBUG engine::execute_query: Using CACHED plan (cte_results.len()={})", cte_results.len());
             cached_plan
         } else {
+            eprintln!("DEBUG engine::execute_query: Building NEW plan (cte_results.len()={})", cte_results.len());
         // 3. Parse SQL using enhanced parser
-        let ast = parse_sql(sql)?;
         let parsed = extract_query_info_enhanced(&ast)?;
+        eprintln!("DEBUG engine::execute_query: Parsed columns: {:?}, table_aliases: {:?}", parsed.columns, parsed.table_aliases);
         
         // Debug: check if tables were extracted
         if parsed.tables.is_empty() {
@@ -283,41 +401,6 @@ impl HypergraphSQLEngine {
                 sql,
                 available_tables
             );
-        }
-        
-        // 3.5. Extract CTE context if present and execute CTEs
-        let (cte_context, cte_results) = if let sqlparser::ast::Statement::Query(query) = &ast {
-            if let Some(with) = &query.with {
-                let cte_ctx = crate::query::cte::CTEContext::from_query(query)?;
-                
-                // Execute CTEs in order and cache results
-                let mut cte_result_cache = std::collections::HashMap::new();
-                let planner = QueryPlanner::from_arc(self.graph.clone());
-                
-                for cte_name in cte_ctx.names() {
-                    if let Some(cte_def) = cte_ctx.get(&cte_name) {
-                        // Execute the CTE query
-                        let cte_result = self.execution_engine.execute_subquery_ast(
-                            &cte_def.query,
-                            &planner
-                        )?;
-                        
-                        // Cache the result (store batches)
-                        cte_result_cache.insert(cte_name.clone(), cte_result.batches);
-                    }
-                }
-                
-                (Some(cte_ctx), cte_result_cache)
-            } else {
-                (None, std::collections::HashMap::new())
-            }
-        } else {
-            (None, std::collections::HashMap::new())
-        };
-        
-        // Store CTE results in materialized_views (temporary storage for CTE results)
-        for (cte_name, cte_batches) in &cte_results {
-            self.materialized_views.insert(format!("__CTE_{}", cte_name), cte_batches.clone());
         }
         
         // 3.7. Store table aliases in node metadata for better schema resolution
@@ -405,8 +488,11 @@ impl HypergraphSQLEngine {
         };
 
         // 2.5. Try trace-based specialized execution for hot, simple queries
-        if let Some(result) = self.try_execute_trace_specialized(&signature, &plan) {
-            return Ok(result);
+        // NOTE: Skip trace-based execution if we have CTEs, as they require cte_results
+        if cte_results.is_empty() {
+            if let Some(result) = self.try_execute_trace_specialized(&signature, &plan) {
+                return Ok(result);
+            }
         }
         
         // 2.6. Try shared execution (if enabled and bundle available)
@@ -419,13 +505,68 @@ impl HypergraphSQLEngine {
             self.add_query_to_bundler(&signature, &plan);
         }
         
-        // 6. Execute plan (use adaptive if enabled)
+        // Phase 3: Execute main query with CTE results available
+        // All CTE results have been materialized in Phase 2, so they're guaranteed to be available
+        eprintln!("DEBUG engine::execute_query: Phase 3 - Executing main query. cte_results.len()={}", cte_results.len());
+        if !cte_results.is_empty() {
+            eprintln!("DEBUG engine::execute_query: Passing {} CTE results to execution engine with keys: {:?}", 
+                cte_results.len(), cte_results.keys().collect::<Vec<_>>());
+        }
+        
+        // Create subquery executor for scalar subqueries (correlated subqueries)
+        use crate::execution::subquery_executor::DefaultSubqueryExecutor;
+        use crate::query::planner::QueryPlanner;
+        let planner = QueryPlanner::from_arc(self.graph.clone());
+        let subquery_executor = Arc::new(DefaultSubqueryExecutor::with_graph(
+            self.graph.clone(),
+            planner,
+        ));
+        
         let result = if self.use_adaptive && self.adaptive_engine.is_some() {
-            let stats = Arc::new(RuntimeStatistics::new());
-            self.adaptive_engine.as_ref().unwrap().execute_adaptive(&plan, stats)?
+            // NOTE: Adaptive execution doesn't currently support CTE results or subquery executor
+            // For CTEs or subqueries, use standard execution path to ensure cte_results and subquery_executor are available
+            eprintln!("DEBUG engine::execute_query: Using standard execution (not adaptive) to ensure CTE results and subquery executor are available");
+            self.execution_engine.execute_with_subquery_executor(
+                &plan,
+                None, // max_time_ms
+                None, // max_scan_rows
+                if cte_results.is_empty() { None } else { Some(&cte_results) },
+                Some(subquery_executor.clone() as Arc<dyn crate::query::expression::SubqueryExecutor>),
+            )?
         } else {
-            self.execution_engine.execute(&plan)?
+            // Standard execution path - pass CTE results and subquery executor
+            self.execution_engine.execute_with_subquery_executor(
+                &plan,
+                None, // max_time_ms
+                None, // max_scan_rows
+                if cte_results.is_empty() { None } else { Some(&cte_results) },
+                Some(subquery_executor.clone() as Arc<dyn crate::query::expression::SubqueryExecutor>),
+            )?
         };
+        
+        // 6.3. Learn from query pattern (Phase 1: Pattern Learning)
+        if let Ok(mut learner) = self.pattern_learner.lock() {
+            // Parse query again for pattern extraction (parsed is only in plan cache block)
+            if let Ok(ast_for_learn) = parse_sql(sql) {
+                if let Ok(parsed_for_learning) = extract_query_info_enhanced(&ast_for_learn) {
+                    // Compute plan hash for pattern matching
+                    use std::hash::{Hash, Hasher};
+                    use std::collections::hash_map::DefaultHasher;
+                    let mut hasher = DefaultHasher::new();
+                    format!("{:?}", plan).hash(&mut hasher);
+                    let plan_hash = hasher.finish();
+                    
+                    if let Err(e) = learner.learn_from_query(
+                        &parsed_for_learning,
+                        &result,
+                        result.execution_time_ms,
+                        plan_hash,
+                    ) {
+                        eprintln!("Warning: Failed to learn from query pattern: {}", e);
+                    }
+                }
+            }
+        }
         
         // 6.5. Track join statistics if JOINs were executed (Phase 2: Join statistics)
         // Parse query again to get join information (parsed is only in scope inside plan cache block)
@@ -1887,6 +2028,63 @@ impl HypergraphSQLEngine {
         })
     }
     
+    /// Execute multiple statements in a transaction context
+    fn execute_multi_statement_transaction(&mut self, statements: &[&str]) -> Result<ExecutionQueryResult> {
+        let mut last_result = ExecutionQueryResult {
+            batches: vec![],
+            row_count: 0,
+            execution_time_ms: 0.0,
+        };
+        
+        // Execute each statement in sequence (parse and execute directly, don't split again)
+        for statement in statements {
+            // Parse and execute directly without splitting (to avoid recursion)
+            let ast = parse_sql(statement).map_err(|e| anyhow::anyhow!("SQL Parse Error in multi-statement transaction: {}", e))?;
+            
+            // Route to appropriate handler based on statement type
+            let result = match &ast {
+                sqlparser::ast::Statement::Query(_) => {
+                    // SELECT query
+                    self.execute_select_query(statement, false)
+                }
+                sqlparser::ast::Statement::Insert { .. } => {
+                    let insert_stmt = extract_insert(&ast)?;
+                    self.execute_insert(insert_stmt)
+                }
+                sqlparser::ast::Statement::Update { .. } => {
+                    let update_stmt = extract_update(&ast)?;
+                    self.execute_update(update_stmt)
+                }
+                sqlparser::ast::Statement::Delete { .. } => {
+                    let delete_stmt = extract_delete(&ast)?;
+                    self.execute_delete(delete_stmt)
+                }
+                sqlparser::ast::Statement::CreateTable { .. } => {
+                    let create_stmt = extract_create_table(&ast)?;
+                    self.execute_create_table(create_stmt)
+                }
+                sqlparser::ast::Statement::Drop { .. } => {
+                    let table_name = extract_drop_table(&ast)?;
+                    self.execute_drop_table(&table_name)
+                }
+                sqlparser::ast::Statement::StartTransaction { .. } => {
+                    self.execute_begin_transaction()
+                }
+                sqlparser::ast::Statement::Commit { .. } => {
+                    self.execute_commit_transaction()
+                }
+                sqlparser::ast::Statement::Rollback { .. } => {
+                    self.execute_rollback_transaction()
+                }
+                _ => anyhow::bail!("Unsupported statement type in transaction: {:?}", ast),
+            }?;
+            
+            last_result = result;
+        }
+        
+        Ok(last_result)
+    }
+    
     /// Rollback the current transaction
     fn execute_rollback_transaction(&mut self) -> Result<ExecutionQueryResult> {
         if let Some(txn_id) = self.current_transaction {
@@ -2304,9 +2502,12 @@ impl HypergraphSQLEngine {
                 for cte_name in cte_ctx.names() {
                     if let Some(cte_def) = cte_ctx.get(&cte_name) {
                         // Execute the CTE query
+                        // EDGE CASE 2 FIX: Pass CTE context and results for nested CTE support
                         let cte_result = self.execution_engine.execute_subquery_ast(
                             &cte_def.query,
-                            &planner
+                            &planner,
+                            Some(&cte_ctx), // Pass CTE context so planner knows which names are CTEs
+                            Some(&cte_result_cache), // Pass accumulated CTE results for data access
                         )?;
                         
                         // Cache the result (store batches)

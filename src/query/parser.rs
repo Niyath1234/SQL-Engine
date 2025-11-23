@@ -115,6 +115,8 @@ pub struct FilterInfo {
     pub in_values: Option<Vec<String>>,
     /// For LIKE/NOT LIKE: pattern string (supports % and _ wildcards)
     pub pattern: Option<String>,
+    /// For subqueries: expression to evaluate per row (e.g., correlated subquery)
+    pub subquery_expression: Option<crate::query::expression::Expression>,
 }
 
 #[derive(Clone, Debug)]

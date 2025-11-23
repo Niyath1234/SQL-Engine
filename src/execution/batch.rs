@@ -53,7 +53,10 @@ impl ExecutionBatch {
     /// Apply selection vector (filter rows)
     pub fn apply_selection(&mut self, new_selection: &bitvec::prelude::BitVec) {
         self.selection = new_selection.clone();
+        let old_row_count = self.row_count;
         self.row_count = self.selection.count_ones();
+        eprintln!("DEBUG ExecutionBatch::apply_selection: old_row_count={}, new_row_count={}, selection.count_ones()={}", 
+            old_row_count, self.row_count, self.selection.count_ones());
     }
     
     /// Get selected row count
