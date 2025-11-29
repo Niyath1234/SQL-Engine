@@ -118,6 +118,19 @@ impl HyperGraph {
         None
     }
     
+    /// Rebuild the table_index by scanning all nodes
+    /// This is useful after loading nodes from persistent storage
+    pub fn rebuild_table_index(&self) {
+        self.table_index.clear();
+        for (_, node) in self.iter_nodes() {
+            if matches!(node.node_type, crate::hypergraph::node::NodeType::Table) {
+                if let Some(table) = &node.table_name {
+                    self.table_index.insert(table.to_lowercase(), node.id);
+                }
+            }
+        }
+    }
+    
     /// Get column nodes for a table (O(n) but faster with index)
     pub fn get_column_nodes(&self, table_name: &str) -> Vec<Arc<HyperNode>> {
         let mut result = Vec::new();

@@ -1,7 +1,12 @@
 /// Unified Column Resolution
 /// Provides canonical column resolution logic for all operators
+/// 
+/// COLID: Now supports both old SchemaRef-based resolution (for backward compatibility)
+/// and new ColumnSchema-based ColId resolution (for ColId architecture)
 use arrow::datatypes::{Schema, SchemaRef};
+use crate::execution::column_identity::{ColId, ColumnSchema};
 use std::collections::HashMap;
+use std::sync::Arc;
 use anyhow::{Result, bail};
 
 /// ColumnResolver - Unified column resolution logic
@@ -12,7 +17,7 @@ pub struct ColumnResolver {
 }
 
 impl ColumnResolver {
-    /// Create a new ColumnResolver
+    /// Create a new ColumnResolver (OLD API - uses SchemaRef)
     pub fn new(schema: SchemaRef, table_aliases: HashMap<String, String>) -> Self {
         Self {
             schema,
@@ -20,12 +25,84 @@ impl ColumnResolver {
         }
     }
 
-    /// Create a ColumnResolver with empty table aliases
+    /// Create a ColumnResolver with empty table aliases (OLD API)
     pub fn from_schema(schema: SchemaRef) -> Self {
         Self {
             schema,
             table_aliases: HashMap::new(),
         }
+    }
+    
+    /// COLID: Create a new ColumnResolver from ColumnSchema (NEW API)
+    pub fn from_column_schema(column_schema: &ColumnSchema, table_aliases: HashMap<String, String>) -> Self {
+        // Convert ColumnSchema to Arrow Schema for backward compatibility
+        let arrow_schema = Arc::new(column_schema.to_arrow_schema());
+        Self {
+            schema: arrow_schema,
+            table_aliases,
+        }
+    }
+    
+    /// COLID: Resolve column name to ColId using ColumnSchema (NEW API)
+    /// This is the preferred method for ColId-based resolution
+    pub fn resolve_to_col_id(column_schema: &ColumnSchema, column_name: &str, table_aliases: &HashMap<String, String>) -> Result<ColId> {
+        let column_name = column_name.trim();
+        
+        // Strategy 1: Direct name_map lookup (fastest)
+        if let Some(col_id) = column_schema.resolve(column_name) {
+            return Ok(col_id);
+        }
+        
+        // Strategy 2: Try with fallback resolution
+        if let Some(col_id) = column_schema.resolve(column_name) {
+            return Ok(col_id);
+        }
+        
+        // Strategy 3: Resolve table alias if column is qualified
+        if column_name.contains('.') {
+            let parts: Vec<&str> = column_name.split('.').collect();
+            if parts.len() == 2 {
+                let table_part = parts[0].trim();
+                let col_part = parts[1].trim();
+                
+                // Try resolving table alias
+                if let Some(actual_table) = table_aliases.get(table_part) {
+                    let table_qualified = format!("{}.{}", actual_table, col_part);
+                    if let Some(col_id) = column_schema.resolve(&table_qualified) {
+                        return Ok(col_id);
+                    }
+                }
+                
+                // Try alias.column directly (might be in name_map)
+                if let Some(col_id) = column_schema.resolve(column_name) {
+                    return Ok(col_id);
+                }
+                
+                // Fall back to unqualified column name
+                return Self::resolve_to_col_id(column_schema, col_part, table_aliases);
+            }
+        }
+        
+        // Strategy 4: Try all table aliases with unqualified name
+        for alias in table_aliases.keys() {
+            let qualified = format!("{}.{}", alias, column_name);
+            if let Some(col_id) = column_schema.resolve(&qualified) {
+                return Ok(col_id);
+            }
+        }
+        
+        // All strategies failed
+        let available_cols: Vec<String> = column_schema.name_map.keys().cloned().collect();
+        bail!(
+            "Column '{}' not found in ColumnSchema. Available columns: {:?}",
+            column_name,
+            available_cols
+        );
+    }
+    
+    /// COLID: Resolve column name to ColId, returning None if not found (NEW API)
+    pub fn try_resolve_to_col_id(column_schema: &ColumnSchema, column_name: &str, table_aliases: &HashMap<String, String>) -> Option<ColId> {
+        Self::resolve_to_col_id(column_schema, column_name, table_aliases).ok()
     }
 
     /// Resolve a column name to a column index

@@ -32,7 +32,7 @@ pub struct HyperEdge {
     pub materialized_result: Option<MaterializedJoin>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EdgeId(pub u64);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

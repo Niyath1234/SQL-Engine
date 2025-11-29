@@ -5,7 +5,7 @@ use crate::query::plan::*;
 use crate::hypergraph::graph::HyperGraph;
 use anyhow::Result;
 use std::sync::Arc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// CTE context - stores CTE definitions
 #[derive(Clone, Debug)]
@@ -72,6 +72,109 @@ impl CTEContext {
     /// Get all CTE names
     pub fn names(&self) -> Vec<String> {
         self.ctes.keys().cloned().collect()
+    }
+    
+    /// Detect mutual CTE dependencies (cycles in CTE dependency graph)
+    /// Returns error if cycle is detected, which usually indicates a query design error
+    pub fn detect_mutual_dependencies(&self) -> Result<()> {
+        use std::collections::{HashSet, VecDeque};
+        
+        // Build dependency graph: CTE name -> set of CTEs it references
+        let mut dependencies: HashMap<String, HashSet<String>> = HashMap::new();
+        
+        for (cte_name, cte_def) in &self.ctes {
+            let mut deps = HashSet::new();
+            
+            // Extract table references from CTE query
+            self.extract_cte_references(&cte_def.query, &mut deps);
+            
+            // Remove self-reference (allowed for recursive CTEs)
+            deps.remove(cte_name);
+            
+            dependencies.insert(cte_name.clone(), deps);
+        }
+        
+        // Detect cycles using DFS
+        let mut visited = HashSet::new();
+        let mut recursion_stack = HashSet::new();
+        
+        for cte_name in self.ctes.keys() {
+            if !visited.contains(cte_name) {
+                if self.has_cycle(cte_name, &dependencies, &mut visited, &mut recursion_stack) {
+                    anyhow::bail!(
+                        "Mutual CTE dependency detected (cycle in CTE dependency graph). \
+                        This usually indicates a query design error. Consider restructuring your CTEs."
+                    );
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Extract CTE references from a query AST
+    /// This is a simplified implementation that uses string matching
+    /// A full implementation would properly walk the AST
+    fn extract_cte_references(&self, query: &Query, deps: &mut HashSet<String>) {
+        // Simple extraction: look for table references that match CTE names
+        // This is a simplified version - full implementation would walk the AST
+        let query_str = format!("{:?}", query);
+        
+        for cte_name in self.ctes.keys() {
+            // Check if query string contains this CTE name as a table reference
+            // This is a heuristic - in production, we'd properly walk the AST
+            // We look for the CTE name as a standalone word to avoid false positives
+            let pattern = format!(" {} ", cte_name); // Space before and after
+            if query_str.contains(&pattern) || 
+               query_str.starts_with(&format!("{}", cte_name)) ||
+               query_str.ends_with(&format!("{}", cte_name)) {
+                deps.insert(cte_name.clone());
+            }
+        }
+    }
+    
+    /// Check for cycles in dependency graph using DFS
+    fn has_cycle(
+        &self,
+        node: &str,
+        dependencies: &HashMap<String, HashSet<String>>,
+        visited: &mut HashSet<String>,
+        recursion_stack: &mut HashSet<String>,
+    ) -> bool {
+        visited.insert(node.to_string());
+        recursion_stack.insert(node.to_string());
+        
+        if let Some(deps) = dependencies.get(node) {
+            for dep in deps {
+                if !visited.contains(dep) {
+                    if self.has_cycle(dep, dependencies, visited, recursion_stack) {
+                        return true;
+                    }
+                } else if recursion_stack.contains(dep) {
+                    // Found a back edge - cycle detected
+                    return true;
+                }
+            }
+        }
+        
+        recursion_stack.remove(node);
+        false
+    }
+    
+    /// Check if a CTE is recursive (references itself)
+    pub fn is_recursive(&self, cte_name: &str) -> bool {
+        if let Some(cte_def) = self.ctes.get(cte_name) {
+            // Check if CTE is marked as recursive (WITH RECURSIVE)
+            if cte_def.recursive {
+                return true;
+            }
+            
+            // Also check if it actually references itself
+            let query_str = format!("{:?}", cte_def.query);
+            query_str.contains(cte_name)
+        } else {
+            false
+        }
     }
 }
 

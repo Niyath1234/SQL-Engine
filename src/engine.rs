@@ -9,6 +9,7 @@ use crate::query::ddl::{extract_create_table, extract_drop_table, CreateTableSta
 use arrow::array::*;
 use arrow::datatypes::DataType as ArrowDataType;
 use crate::query::planner::QueryPlanner;
+use crate::query::plan::PlanOperator;
 use crate::query::cache::{PlanCache, QuerySignature};
 use crate::query::optimizer::HypergraphOptimizer;
 use crate::execution::engine::{ExecutionEngine, QueryResult as ExecutionQueryResult};
@@ -20,6 +21,7 @@ use crate::storage::memory_tier::MultiTierMemoryManager;
 use crate::storage::adaptive_fragment::AdaptiveFragmentManager;
 use bitvec::prelude::*;
 use crate::storage::tiered_index::TieredIndexManager;
+use crate::storage::tiered_cache::TieredStorage;
 use crate::execution::shared_execution::{QueryBundler, PendingQuery, QueryBundle};
 use crate::result_format;
 use serde::{Deserialize, Serialize};
@@ -60,19 +62,77 @@ pub struct HypergraphSQLEngine {
     current_transaction: Option<u64>,
     /// Query pattern learner (learns from query execution)
     pattern_learner: Arc<std::sync::Mutex<crate::learning::pattern_learner::QueryPatternLearner>>,
+    /// Tiered storage (3-tier: persistent hypergraph, session cache, user patterns)
+    tiered_storage: Option<Arc<std::sync::Mutex<crate::storage::tiered_cache::TieredStorage>>>,
+    /// Auto-save counter for periodic persistence
+    auto_save_counter: std::sync::atomic::AtomicU64,
+    /// Persistent compiled operator cache (WASM modules, micro-kernels)
+    operator_cache: Arc<std::sync::Mutex<crate::cache::operator_cache::OperatorCache>>,
 }
 
 impl HypergraphSQLEngine {
+    /// Debug helper: Print plan structure recursively
+    fn debug_print_plan_structure(op: &PlanOperator, indent: usize) {
+        let indent_str = "  ".repeat(indent);
+        match op {
+            PlanOperator::Scan { table, .. } => {
+                eprintln!("{}Scan({})", indent_str, table);
+            }
+            PlanOperator::Join { predicate, left, right, .. } => {
+                eprintln!("{}Join({} JOIN {} ON {}.{} = {}.{})", 
+                    indent_str,
+                    predicate.left.0, predicate.right.0,
+                    predicate.left.0, predicate.left.1,
+                    predicate.right.0, predicate.right.1);
+                Self::debug_print_plan_structure(left, indent + 1);
+                Self::debug_print_plan_structure(right, indent + 1);
+            }
+            PlanOperator::Project { columns, input, .. } => {
+                eprintln!("{}Project({} columns)", indent_str, columns.len());
+                Self::debug_print_plan_structure(input, indent + 1);
+            }
+            PlanOperator::Filter { input, .. } => {
+                eprintln!("{}Filter", indent_str);
+                Self::debug_print_plan_structure(input, indent + 1);
+            }
+            _ => {
+                eprintln!("{}{:?}", indent_str, std::mem::discriminant(op));
+            }
+        }
+    }
+    
     /// Create a new engine instance
     pub fn new() -> Self {
+        // FEATURE 2: Hardware-aware tuning (benchmark once at startup)
+        use crate::execution::hardware_tuning::HardwareTuningProfile;
+        let hardware_profile = HardwareTuningProfile::benchmark();
+        
         let graph = Arc::new(HyperGraph::new());
-        let planner = QueryPlanner::from_arc(graph.clone());
+        // Initialize planner with configuration
+        // Use production config by default, but can be customized
+        let config = crate::query::planner_config::PlannerConfig::default();
+        let mut planner = QueryPlanner::from_arc_with_config(graph.clone(), config);
+        
+        // Store hardware profile in planner (if we add a field for it)
+        // For now, hardware profile will be used by execution engine
+        
         // Optimizer can work with a clone for now (it's only used for join reordering)
         let optimizer = HypergraphOptimizer::new((*graph).clone());
         let plan_cache = PlanCache::new(1000); // Cache up to 1000 plans
         // Cache: max 100 results, 5 min TTL, 500MB memory limit
         let result_cache = ResultCache::new_with_memory_limit(100, 300, 500 * 1024 * 1024);
-        let execution_engine = ExecutionEngine::from_arc(graph.clone());
+        
+        // INTEGRATION: Initialize persistent compiled operator cache (Phase C)
+        // Cache directory: .operator_cache, max size: 100MB
+        let cache_dir = std::path::PathBuf::from(".operator_cache");
+        let operator_cache = Arc::new(std::sync::Mutex::new(
+            crate::cache::operator_cache::OperatorCache::new(cache_dir, 100 * 1024 * 1024)
+        ));
+        eprintln!("✅ Initialized persistent compiled operator cache (100MB limit)");
+        
+        // Create execution engine with operator cache
+        let operator_cache_clone = operator_cache.clone();
+        let execution_engine = ExecutionEngine::with_operator_cache(graph.clone(), operator_cache_clone);
         let execution_engine_for_adaptive = ExecutionEngine::from_arc(graph.clone());
         let adaptive_engine = Some(AdaptiveExecutionEngine::new(execution_engine_for_adaptive));
         
@@ -113,6 +173,24 @@ impl HypergraphSQLEngine {
             )
         );
         
+        // INTEGRATION: Initialize 3-tier storage (Level 1: Persistent hypergraph, Level 2: Session cache, Level 3: User patterns)
+        let tiered_storage = match TieredStorage::new(graph.clone()) {
+            Ok(storage) => {
+                eprintln!("✅ Initialized 3-tier storage: Persistent hypergraph loaded, session cache ready");
+                Some(Arc::new(std::sync::Mutex::new(storage)))
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to initialize tiered storage: {}", e);
+                None
+            }
+        };
+        
+        // INTEGRATION: Merge existing persistent hypergraph into in-memory graph on startup
+        // Note: Currently persistent storage only stores statistics, not full node data
+        // Tables need to be recreated in each session, but we rebuild the index for any existing nodes
+        // Rebuild table_index to ensure any existing nodes are properly indexed
+        graph.rebuild_table_index();
+        
         Self {
             graph,
             planner,
@@ -133,6 +211,9 @@ impl HypergraphSQLEngine {
             transaction_manager,
             current_transaction: None,
             pattern_learner,
+            tiered_storage,
+            auto_save_counter: std::sync::atomic::AtomicU64::new(0),
+            operator_cache,
         }
     }
     
@@ -322,7 +403,7 @@ impl HypergraphSQLEngine {
                 // Phase 2: Materialize all CTEs - Execute each CTE and cache results
                 // This happens BEFORE plan building, ensuring results are always available
                 let mut cte_result_cache = std::collections::HashMap::new();
-                let planner = QueryPlanner::from_arc(self.graph.clone());
+                let planner = QueryPlanner::from_arc_with_options(self.graph.clone(), self.planner.use_cascades);
                 
                 eprintln!("DEBUG engine::execute_query: Phase 2 - Materializing {} CTEs", cte_ctx.names().len());
                 for cte_name in cte_ctx.names() {
@@ -377,15 +458,49 @@ impl HypergraphSQLEngine {
                 cte_results.keys().collect::<Vec<_>>());
         }
         
+        // 2.5. Parse SQL to extract derived tables (needed before plan cache check)
+        let parsed = extract_query_info_enhanced(&ast)?;
+        eprintln!("DEBUG engine::execute_query: Parsed columns: {:?}, table_aliases: {:?}", parsed.columns, parsed.table_aliases);
+        
+        // 2.6. Execute derived tables (subqueries in FROM) before main query
+        // Similar to CTEs, derived tables need to be executed first
+        let mut derived_table_results = std::collections::HashMap::new();
+        if !parsed.derived_tables.is_empty() {
+            eprintln!("DEBUG engine::execute_query: Found {} derived tables to execute", parsed.derived_tables.len());
+            let planner = QueryPlanner::from_arc(self.graph.clone());
+            
+            for (derived_table_name, derived_table_query) in &parsed.derived_tables {
+                eprintln!("DEBUG engine::execute_query: Executing derived table '{}'", derived_table_name);
+                // Execute the derived table subquery
+                // Pass CTE context and results if available (derived tables can reference CTEs)
+                let derived_result = self.execution_engine.execute_subquery_ast(
+                    &Box::new(derived_table_query.clone()),
+                    &planner,
+                    cte_context.as_ref(),
+                    if cte_results.is_empty() { None } else { Some(&cte_results) },
+                )?;
+                
+                eprintln!("DEBUG engine::execute_query: Derived table '{}' executed: {} batches, {} total rows", 
+                    derived_table_name, derived_result.batches.len(), derived_result.row_count);
+                
+                // Store results with both plain name and __DERIVED_ prefix
+                let batches_clone = derived_result.batches.clone();
+                derived_table_results.insert(derived_table_name.clone(), derived_result.batches);
+                derived_table_results.insert(format!("__DERIVED_{}", derived_table_name), batches_clone);
+            }
+            eprintln!("DEBUG engine::execute_query: {} derived tables executed", derived_table_results.len() / 2);
+        }
+        
+        // Merge derived table results with CTE results (both use the same cache structure)
+        let mut all_subquery_results = cte_results.clone();
+        all_subquery_results.extend(derived_table_results);
+        
         // 2. Check plan cache
         let plan = if let Some(cached_plan) = self.plan_cache.get(&signature) {
             eprintln!("DEBUG engine::execute_query: Using CACHED plan (cte_results.len()={})", cte_results.len());
             cached_plan
         } else {
             eprintln!("DEBUG engine::execute_query: Building NEW plan (cte_results.len()={})", cte_results.len());
-        // 3. Parse SQL using enhanced parser
-        let parsed = extract_query_info_enhanced(&ast)?;
-        eprintln!("DEBUG engine::execute_query: Parsed columns: {:?}, table_aliases: {:?}", parsed.columns, parsed.table_aliases);
         
         // Debug: check if tables were extracted
         if parsed.tables.is_empty() {
@@ -459,10 +574,12 @@ impl HypergraphSQLEngine {
         }
         
         // 4. Plan query with CTE context
-        let planner = if let Some(cte_ctx) = &cte_context {
-            self.planner.clone().with_cte_context(cte_ctx.clone())
+        // Create a new planner instance with CTE context if needed
+        let mut planner = if let Some(cte_ctx) = &cte_context {
+            QueryPlanner::from_arc_with_options(self.graph.clone(), self.planner.use_cascades)
+                .with_cte_context(cte_ctx.clone())
         } else {
-            self.planner.clone()
+            QueryPlanner::from_arc_with_options(self.graph.clone(), self.planner.use_cascades)
         };
         
         // Check if this is a set operation and use special planning
@@ -508,6 +625,8 @@ impl HypergraphSQLEngine {
         // Phase 3: Execute main query with CTE results available
         // All CTE results have been materialized in Phase 2, so they're guaranteed to be available
         eprintln!("DEBUG engine::execute_query: Phase 3 - Executing main query. cte_results.len()={}", cte_results.len());
+        eprintln!("DEBUG engine::execute_query: Plan structure BEFORE execution:");
+        Self::debug_print_plan_structure(&plan.root, 0);
         if !cte_results.is_empty() {
             eprintln!("DEBUG engine::execute_query: Passing {} CTE results to execution engine with keys: {:?}", 
                 cte_results.len(), cte_results.keys().collect::<Vec<_>>());
@@ -515,34 +634,261 @@ impl HypergraphSQLEngine {
         
         // Create subquery executor for scalar subqueries (correlated subqueries)
         use crate::execution::subquery_executor::DefaultSubqueryExecutor;
-        use crate::query::planner::QueryPlanner;
-        let planner = QueryPlanner::from_arc(self.graph.clone());
+        // Create planner for subquery executor
+        let subquery_planner = QueryPlanner::from_arc_with_options(self.graph.clone(), self.planner.use_cascades);
         let subquery_executor = Arc::new(DefaultSubqueryExecutor::with_graph(
             self.graph.clone(),
-            planner,
+            subquery_planner,
         ));
         
-        let result = if self.use_adaptive && self.adaptive_engine.is_some() {
-            // NOTE: Adaptive execution doesn't currently support CTE results or subquery executor
-            // For CTEs or subqueries, use standard execution path to ensure cte_results and subquery_executor are available
-            eprintln!("DEBUG engine::execute_query: Using standard execution (not adaptive) to ensure CTE results and subquery executor are available");
-            self.execution_engine.execute_with_subquery_executor(
-                &plan,
-                None, // max_time_ms
-                None, // max_scan_rows
-                if cte_results.is_empty() { None } else { Some(&cte_results) },
-                Some(subquery_executor.clone() as Arc<dyn crate::query::expression::SubqueryExecutor>),
-            )?
-        } else {
-            // Standard execution path - pass CTE results and subquery executor
-            self.execution_engine.execute_with_subquery_executor(
-                &plan,
-                None, // max_time_ms
-                None, // max_scan_rows
-                if cte_results.is_empty() { None } else { Some(&cte_results) },
-                Some(subquery_executor.clone() as Arc<dyn crate::query::expression::SubqueryExecutor>),
-            )?
+        // Execute plan (always use standard execution for now to support CTEs and subqueries)
+        let result = self.execution_engine.execute_with_subquery_executor(
+            &plan,
+            None, // max_time_ms
+            None, // max_scan_rows
+            if all_subquery_results.is_empty() { None } else { Some(&all_subquery_results) },
+            Some(subquery_executor.clone() as Arc<dyn crate::query::expression::SubqueryExecutor>),
+        )?;
+        
+        // Collect runtime statistics for learning and adaptive optimization
+        let actual_cardinality = result.row_count;
+        let estimated_cardinality = plan.estimated_cardinality as f64;
+        
+        // Record runtime statistics
+        use crate::query::adaptive_optimizer::RuntimeStatistics as AdaptiveRuntimeStats;
+        use crate::query::adaptive_optimizer::OperatorStats;
+        use std::collections::HashMap;
+        
+        let runtime_stats = AdaptiveRuntimeStats {
+            actual_cardinality,
+            execution_time_ms: result.execution_time_ms,
+            memory_used_bytes: 0, // TODO: get from execution engine
+            rows_spilled: 0, // TODO: get from execution engine
+            operator_stats: HashMap::new(), // TODO: collect per-operator stats
         };
+        
+        // Only record if adaptive optimization is enabled
+        if self.planner.config.enable_adaptive {
+            self.planner.adaptive_optimizer.record_runtime_stats(runtime_stats);
+        }
+        
+        // Stage 5: Update RL policy after query execution
+        if let Some(ref mut rl_policy) = self.planner.rl_policy {
+            use crate::query::rl_cost_model::{extract_features_from_plan, rl_update};
+            let features = extract_features_from_plan(&plan);
+            // Note: rows_spilled is not available in ExecutionQueryResult
+            // In a full implementation, we'd get this from execution engine statistics
+            let spill_penalty = 0.0; // TODO: Get from execution engine
+            rl_update(rl_policy, &features, result.execution_time_ms, spill_penalty);
+        }
+        
+        // Stage 5: Check for statistics drift
+        if let Some(ref drift_detector) = self.planner.drift_detector {
+            for table in &parsed.tables {
+                if let Some(table_stats) = self.planner.stats.get_table_stats(table) {
+                    let estimated_rows = table_stats.row_count;
+                    // Use actual cardinality from result if available (simplified)
+                    let actual_rows = if parsed.tables.len() == 1 && parsed.joins.is_empty() {
+                        actual_cardinality // Single table query - use result cardinality
+                    } else {
+                        estimated_rows // Multi-table - can't determine actual per table
+                    };
+                    drift_detector.check_drift(table, estimated_rows, actual_rows);
+                }
+            }
+        }
+        
+        // Stage 5: Record query sequence for prediction
+        if let Some(ref predictor) = self.planner.query_predictor {
+            use crate::query::fingerprint::fingerprint;
+            let current_fingerprint = fingerprint(&parsed);
+            // In a full implementation, we'd track previous query fingerprint
+            // For now, we just ensure predictor is aware of this query
+            // Sequence recording would happen: predictor.record_sequence(&prev_fp, &current_fp);
+        }
+        
+        // HOLY GRAIL: Record execution feedback for continuous learning
+        if let Some(ref continuous_learning) = self.planner.continuous_learning {
+            use crate::query::rl_cost_model::extract_features_from_plan;
+            use crate::query::continuous_learning::ExecutionFeedback;
+            let features = extract_features_from_plan(&plan);
+            let feedback = ExecutionFeedback {
+                query_id: format!("query_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()),
+                estimated_cost: plan.estimated_cost,
+                actual_execution_time_ms: result.execution_time_ms,
+                actual_memory_bytes: 0, // TODO: get from execution engine
+                actual_rows: actual_cardinality,
+                features,
+            };
+            continuous_learning.record_feedback(feedback);
+        }
+        
+        // HOLY GRAIL: Record sample for online CE learning
+        if let Some(ref online_ce) = self.planner.online_ce_learner {
+            use crate::query::online_ce::CESample;
+            use crate::query::learned_ce::QueryFeatures;
+            // Extract features (simplified - would use actual query features)
+            let features = QueryFeatures {
+                num_tables: parsed.tables.len(),
+                num_joins: parsed.joins.len(),
+                num_predicates: parsed.filters.len(),
+                num_aggregates: parsed.aggregates.len(),
+                table_cardinalities: parsed.tables.iter().map(|t| {
+                    if let Some(stats) = self.planner.stats.get_table_stats(t) {
+                        (stats.row_count as f64).ln()
+                    } else {
+                        10.0
+                    }
+                }).collect(),
+                predicate_selectivities: parsed.filters.iter().map(|_| 0.1).collect(),
+                join_selectivities: parsed.joins.iter().map(|_| 0.5).collect(),
+                has_group_by: !parsed.group_by.is_empty(),
+                has_order_by: !parsed.order_by.is_empty(),
+                has_limit: parsed.limit.is_some(),
+            };
+            let sample = CESample {
+                features,
+                estimated_cardinality: estimated_cardinality,
+                actual_cardinality: actual_cardinality as f64,
+                timestamp: std::time::SystemTime::now(),
+            };
+            online_ce.record_sample(sample);
+        }
+        
+        // HOLY GRAIL: Record access patterns for auto-indexing
+        if let Some(ref index_recommender) = self.planner.auto_index_recommender {
+            for table in &parsed.tables {
+                // Record table access
+                for col in &parsed.columns {
+                    if let Some((t, c)) = col.split_once('.') {
+                        if t == table {
+                            index_recommender.record_access(table, c);
+                        }
+                    }
+                }
+                // Record filter patterns
+                for filter in &parsed.filters {
+                    if filter.table == *table {
+                        index_recommender.record_filter(&filter.table, &filter.column, "=");
+                    }
+                }
+                // Record join patterns
+                for join in &parsed.joins {
+                    if join.left_table == *table {
+                        index_recommender.record_join(&join.left_table, &join.left_column, &join.right_table, &join.right_column);
+                    } else if join.right_table == *table {
+                        index_recommender.record_join(&join.left_table, &join.left_column, &join.right_table, &join.right_column);
+                    }
+                }
+            }
+        }
+        
+        // HOLY GRAIL: Record filter patterns for auto-partitioning
+        if let Some(ref partition_recommender) = self.planner.auto_partition_recommender {
+            for filter in &parsed.filters {
+                partition_recommender.record_filter(&filter.table, &filter.column);
+            }
+        }
+        
+        // HOLY GRAIL: Record access patterns for storage tuning
+        if let Some(ref storage_tuner) = self.planner.auto_storage_tuner {
+            for table in &parsed.tables {
+                // Determine access type (simplified)
+                let access_type = if parsed.joins.is_empty() && parsed.filters.len() <= 1 {
+                    "point_lookup"
+                } else if parsed.columns.len() < 5 {
+                    "scan_columns"
+                } else {
+                    "scan_all"
+                };
+                storage_tuner.record_access(table, access_type);
+            }
+        }
+        
+        // HOLY GRAIL: Record query performance for auto-reclustering
+        if let Some(ref recluster_manager) = self.planner.auto_recluster_manager {
+            for table in &parsed.tables {
+                recluster_manager.record_query_performance(table, result.execution_time_ms);
+            }
+        }
+        
+        // Record training data for ML models (always enabled for learning)
+        if let Some(ref mut training_pipeline) = self.planner.training_pipeline {
+            use crate::query::learned_ce::compute_query_fingerprint;
+            use crate::query::learned_ce::QueryFeatures;
+            
+            // Re-parse to get parsed query (it's out of scope)
+            let parsed_for_training = extract_query_info_enhanced(&ast)?;
+            
+            // Compute query fingerprint
+            let query_fingerprint = compute_query_fingerprint(
+                &parsed_for_training.tables,
+                &parsed_for_training.joins.iter().map(|j| {
+                    (j.left_table.clone(), j.left_column.clone(), j.right_table.clone(), j.right_column.clone())
+                }).collect::<Vec<_>>(),
+                &parsed_for_training.filters.iter().map(|f| format!("{} {} {}", f.table, f.column, f.value)).collect::<Vec<_>>(),
+            );
+            
+            // Build query features
+            let features = QueryFeatures {
+                num_tables: parsed_for_training.tables.len(),
+                num_joins: parsed_for_training.joins.len(),
+                num_predicates: parsed_for_training.filters.len(),
+                num_aggregates: parsed_for_training.aggregates.len(),
+                table_cardinalities: parsed_for_training.tables.iter().map(|t| {
+                    // Get table stats if available
+                    if let Some(stats) = self.planner.stats.get_table_stats(t) {
+                        (stats.row_count as f64).ln()
+                    } else {
+                        10.0 // Default log cardinality
+                    }
+                }).collect(),
+                predicate_selectivities: parsed_for_training.filters.iter().map(|f| {
+                    // Estimate selectivity (simplified)
+                    0.1 // Default 10% selectivity
+                }).collect(),
+                join_selectivities: parsed_for_training.joins.iter().map(|_| {
+                    // Estimate join selectivity (simplified)
+                    0.5 // Default 50% selectivity
+                }).collect(),
+                has_group_by: !parsed_for_training.group_by.is_empty(),
+                has_order_by: !parsed_for_training.order_by.is_empty(),
+                has_limit: parsed_for_training.limit.is_some(),
+            };
+            
+            // Get estimates
+            let stats_estimate = estimated_cardinality;
+            let ml_estimate = self.planner.learned_ce.estimate_cardinality(&features, stats_estimate)
+                .ok();
+            let final_estimate = ml_estimate.unwrap_or(stats_estimate);
+            
+            // Record for training
+            training_pipeline.process_execution(
+                query_fingerprint,
+                features,
+                stats_estimate,
+                ml_estimate,
+                final_estimate,
+                actual_cardinality as f64,
+            );
+        }
+        
+        // Check if reoptimization is needed based on runtime feedback
+        if self.planner.config.enable_adaptive {
+            if self.planner.adaptive_optimizer.should_reoptimize(
+                estimated_cardinality,
+                actual_cardinality,
+            ) {
+                tracing::warn!(
+                    "Large estimation error detected: estimated={:.0}, actual={}, error={:.1}%",
+                    estimated_cardinality,
+                    actual_cardinality,
+                    (estimated_cardinality - actual_cardinality as f64).abs() / estimated_cardinality.max(1.0) * 100.0
+                );
+                // In full implementation, would trigger reoptimization here
+                // For now, just log the warning
+            }
+        }
         
         // 6.3. Learn from query pattern (Phase 1: Pattern Learning)
         if let Ok(mut learner) = self.pattern_learner.lock() {
@@ -1144,23 +1490,91 @@ impl HypergraphSQLEngine {
                 table_name.to_string(),
                 column_name.clone(),
             );
+            
+            // Build bitmap index for this column fragment
+            let mut fragment_with_index = fragment.clone();
+            // Set table and column name in metadata for bitmap index building
+            fragment_with_index.metadata.table_name = Some(table_name.to_string());
+            fragment_with_index.metadata.column_name = Some(column_name.clone());
+            
+            if let Err(e) = fragment_with_index.build_bitmap_index_new() {
+                eprintln!("Warning: Failed to build bitmap index for {}.{}: {}", table_name, column_name, e);
+            }
+            
+            // Store bitmap index in column node metadata (serialized)
+            // Note: BitmapIndex doesn't implement Serialize, so we skip serialization for now
+            // The index is stored directly in the fragment, which is sufficient
+            // In production, we could add custom serialization if needed
+            
+            // ATTACH LEARNED INDEX: Build learned index for sorted columns
+            // Check if column is sorted (for learned index to be beneficial)
+            if let Some(array) = fragment_with_index.get_array() {
+                // Extract values and check if sorted
+                let mut values = Vec::new();
+                for i in 0..array.len() {
+                    if let Some(value) = crate::execution::operators::extract_value(&array, i).ok() {
+                        if let crate::storage::fragment::Value::Int64(v) = value {
+                            values.push(v);
+                        }
+                    }
+                }
+                
+                // Check if values are sorted (for learned index)
+                let is_sorted = values.windows(2).all(|w| w[0] <= w[1]);
+                
+                if is_sorted && !values.is_empty() {
+                    // Build learned index
+                    use crate::index::learned::LearnedIndex;
+                    let learned_index = LearnedIndex::build(&values);
+                    
+                    // Store learned index in column node metadata
+                    let model = learned_index.model();
+                    if let Ok(model_json) = serde_json::to_string(model) {
+                        let index_key = format!("learned_index_{}", column_name);
+                        column_node.metadata.insert(index_key, model_json.clone());
+                        
+                        // Also store in table node metadata for quick lookup
+                        let table_index_key = format!("learned_index_{}_{}", table_name, column_name);
+                        table_node.metadata.insert(table_index_key, model_json);
+                    }
+                }
+            }
+            
             // Clone fragment for column node
-            column_node.add_fragment(fragment.clone());
+            column_node.add_fragment(fragment_with_index.clone());
             self.graph.add_node(column_node);
             
             // Add fragment to table node as well
-            table_node.add_fragment(fragment.clone());
+            table_node.add_fragment(fragment_with_index.clone());
             
             // Register fragment in memory manager (L1 by default)
             let fragment_size = fragment.metadata.memory_size.max(1024); // At least 1KB
             self.memory_manager.register_l1(table_node_id, fragment_size);
             
             // Build tiered index for this fragment (as memory filter)
-            self.tiered_index_manager.build_index(table_node_id, fragment_idx, fragment);
+            self.tiered_index_manager.build_index(table_node_id, fragment_idx, &fragment_with_index);
         }
         
         // Add table node to graph
         self.graph.add_node(table_node);
+        
+        // INTEGRATION: Update Level 1 (persistent hypergraph) with new table metadata
+        if let Some(ref tiered) = self.tiered_storage {
+            if let Ok(mut tiered_guard) = tiered.lock() {
+                // Merge the newly loaded table into persistent storage
+                if let Err(e) = tiered_guard.merge_graph_to_persistent() {
+                    eprintln!("Warning: Failed to update persistent hypergraph with table '{}': {}", table_name, e);
+                }
+                
+                // Auto-save every 10 table loads
+                let count = self.auto_save_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if count % 10 == 0 {
+                    if let Err(e) = tiered_guard.save_persistent() {
+                        eprintln!("Warning: Failed to auto-save persistent hypergraph: {}", e);
+                    }
+                }
+            }
+        }
         
         println!(" Loaded table '{}' into hypergraph (node_id: {:?}) with {} columns", table_name, table_node_id, columns.len());
         
@@ -1546,6 +1960,8 @@ impl HypergraphSQLEngine {
                     cardinality: column_values.len(),
                     compression: crate::storage::fragment::CompressionType::None,
                     memory_size: 0, // Will be calculated
+                    table_name: None,
+                    column_name: None,
                 },
                 bloom_filter: None,
                 bitmap_index: None,
@@ -1904,6 +2320,8 @@ impl HypergraphSQLEngine {
                     cardinality: 0,
                     compression: crate::storage::fragment::CompressionType::None,
                     memory_size: 0,
+                    table_name: None,
+                    column_name: None,
                 },
                 bloom_filter: None,
                 bitmap_index: None,
@@ -1953,7 +2371,7 @@ impl HypergraphSQLEngine {
     }
     
     /// Execute DROP TABLE statement
-    fn execute_drop_table(&mut self, table_name: &str) -> Result<ExecutionQueryResult> {
+    pub fn execute_drop_table(&mut self, table_name: &str) -> Result<ExecutionQueryResult> {
         use std::time::Instant;
         let start = Instant::now();
         
@@ -2121,7 +2539,7 @@ impl HypergraphSQLEngine {
                     columns.extend_from_slice(cols);
                     break;
                 }
-                PlanOperator::Filter { input, predicates: preds } => {
+                PlanOperator::Filter { input, predicates: preds, where_expression: _ } => {
                     // Extract predicates (simplified)
                     for pred in preds {
                         predicates.push(crate::execution::shared_execution::QueryPredicate {
@@ -2238,6 +2656,8 @@ fn merge_fragments(frag1: &ColumnFragment, frag2: &ColumnFragment) -> Result<Col
             cardinality: frag1.metadata.cardinality + frag2.metadata.cardinality,
             compression: frag1.metadata.compression.clone(),
             memory_size: frag1.metadata.memory_size + frag2.metadata.memory_size,
+            table_name: frag1.metadata.table_name.clone(),
+            column_name: frag1.metadata.column_name.clone(),
         },
         bloom_filter: None,
         bitmap_index: None,
@@ -2497,7 +2917,7 @@ impl HypergraphSQLEngine {
                 
                 // Execute CTEs in order and cache results
                 let mut cte_result_cache = std::collections::HashMap::new();
-                let planner = QueryPlanner::from_arc(self.graph.clone());
+                let planner = QueryPlanner::from_arc_with_options(self.graph.clone(), self.planner.use_cascades);
                 
                 for cte_name in cte_ctx.names() {
                     if let Some(cte_def) = cte_ctx.get(&cte_name) {
@@ -2534,7 +2954,7 @@ impl HypergraphSQLEngine {
             // Parse and plan query with CTE context
             let ast = parse_sql(sql)?;
             let parsed = extract_query_info_enhanced(&ast)?;
-            let mut planner = QueryPlanner::from_arc(self.graph.clone());
+            let mut planner = QueryPlanner::from_arc_with_options(self.graph.clone(), self.planner.use_cascades);
             if let Some(ref cte_ctx) = cte_context {
                 planner = planner.with_cte_context(cte_ctx.clone());
             }
@@ -2869,6 +3289,68 @@ impl HypergraphSQLEngine {
         self.graph.update_node_metadata(table_node_id, metadata_updates);
         
         Ok(())
+    }
+    
+    /// INTEGRATION: Cleanup and save all persistent data (called on shutdown)
+    pub fn shutdown(&mut self) -> Result<()> {
+        if let Some(ref tiered) = self.tiered_storage {
+            if let Ok(mut tiered_guard) = tiered.lock() {
+                // Promote frequently-used session cache items to Level 1
+                tiered_guard.promote_session_to_persistent()?;
+                
+                // Save persistent hypergraph to disk
+                tiered_guard.save_persistent()?;
+                
+                // Save user patterns (Level 3) if loaded
+                if let Some(ref mut patterns) = tiered_guard.user_patterns {
+                    Arc::get_mut(patterns).unwrap().save_to_device()?;
+                }
+                
+                eprintln!("✅ Shutdown: Saved persistent hypergraph, promoted session cache, saved user patterns");
+            }
+        }
+        Ok(())
+    }
+    
+    /// INTEGRATION: Load user patterns for a specific user (Level 3)
+    pub fn load_user_patterns(&mut self, user_id: &str) -> Result<()> {
+        if let Some(ref tiered) = self.tiered_storage {
+            if let Ok(mut tiered_guard) = tiered.lock() {
+                tiered_guard.load_user_patterns(user_id)?;
+                eprintln!("✅ Loaded user patterns for user: {}", user_id);
+            }
+        }
+        Ok(())
+    }
+    
+    /// INTEGRATION: Get hot tables based on user patterns (Level 3)
+    pub fn get_hot_tables(&self, limit: usize) -> Vec<String> {
+        if let Some(ref tiered) = self.tiered_storage {
+            if let Ok(tiered_guard) = tiered.lock() {
+                if let Some(ref patterns) = tiered_guard.user_patterns {
+                    return patterns.get_hot_tables(limit)
+                        .iter()
+                        .map(|h| h.table_name.clone())
+                        .collect();
+                }
+            }
+        }
+        Vec::new()
+    }
+    
+    /// INTEGRATION: Get predicted queries based on user patterns (Level 3)
+    pub fn get_predicted_queries(&self, limit: usize) -> Vec<String> {
+        if let Some(ref tiered) = self.tiered_storage {
+            if let Ok(tiered_guard) = tiered.lock() {
+                if let Some(ref patterns) = tiered_guard.user_patterns {
+                    return patterns.get_predicted_queries(limit)
+                        .iter()
+                        .map(|p| p.template.clone())
+                        .collect();
+                }
+            }
+        }
+        Vec::new()
     }
 }
 

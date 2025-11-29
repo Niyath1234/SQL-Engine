@@ -6,6 +6,7 @@ use arrow::datatypes::*;
 use arrow::array::Array;
 use bitvec::prelude::*;
 use std::sync::Arc;
+use std::path::PathBuf;
 use anyhow::Result;
 
 /// Convert ExecutionBatch to Arrow RecordBatch

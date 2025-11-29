@@ -583,6 +583,8 @@ fn load_csv(path: &str) -> Result<(usize, Vec<String>, Vec<(String, ColumnFragme
                 cardinality: rows.len(),
                 compression: CompressionType::None,
                 memory_size: 0,
+                table_name: None,
+                column_name: None,
             },
         );
         column_fragments.push((col_name.clone(), fragment));

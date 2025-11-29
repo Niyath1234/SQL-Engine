@@ -52,10 +52,25 @@ pub fn parse_sql(query: &str) -> Result<Statement> {
 
 /// Extract query information from AST
 pub struct ParsedQuery {
+    /// Tables in the query (ordered as they appear in FROM clause)
+    /// Note: This order is for reference only - join order is determined by join_edges graph
     pub tables: Vec<String>,
+    
+    /// Projection columns (selected columns in SELECT clause)
     pub columns: Vec<String>,
+    
+    /// Join edges representing the join graph (unordered)
+    /// Each edge connects two tables with a join predicate
+    /// The planner will determine join order by walking this graph
+    pub join_edges: Vec<JoinEdge>,
+    
+    /// Legacy joins field for backward compatibility during migration
+    /// TODO: Remove after full migration to join_edges
     pub joins: Vec<JoinInfo>,
     pub filters: Vec<FilterInfo>,
+    /// WHERE clause expression tree (for complex OR/AND conditions)
+    /// When present, this is used instead of flattening predicates
+    pub where_expression: Option<crate::query::expression::Expression>,
     pub aggregates: Vec<AggregateInfo>,
     pub window_functions: Vec<WindowFunctionInfo>,
     pub group_by: Vec<String>,
@@ -69,6 +84,9 @@ pub struct ParsedQuery {
     pub distinct: bool,
     /// Table alias mapping: alias -> actual table name (e.g., "d" -> "documents")
     pub table_aliases: std::collections::HashMap<String, String>,
+    /// Derived tables (subqueries in FROM): alias -> subquery AST
+    /// These need to be executed before the main query
+    pub derived_tables: std::collections::HashMap<String, sqlparser::ast::Query>,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +106,52 @@ pub enum ProjectionExprTypeInfo {
     Expression(crate::query::expression::Expression), // For function expressions like VECTOR_SIMILARITY
 }
 
+/// Join Edge represents an edge in the join graph
+/// Each edge connects two tables with a join predicate
+/// 
+/// Design: Join edges are unordered - they represent a graph, not a sequence
+/// The planner will determine join order by walking the graph
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct JoinEdge {
+    /// Left side: fully qualified column reference {table_alias, column_name}
+    pub left: QualifiedColumn,
+    /// Right side: fully qualified column reference {table_alias, column_name}
+    pub right: QualifiedColumn,
+    /// Join type (Inner, Left, Right, Full)
+    pub join_type: JoinType,
+}
+
+/// Fully qualified column reference
+/// Format: {table_alias, column_name}
+/// Example: {table_alias: "c", column_name: "customer_id"} represents "c.customer_id"
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct QualifiedColumn {
+    pub table_alias: String,
+    pub column_name: String,
+}
+
+impl QualifiedColumn {
+    pub fn new(table_alias: String, column_name: String) -> Self {
+        QualifiedColumn { table_alias, column_name }
+    }
+    
+    /// Convert to string format "table.column"
+    pub fn to_string(&self) -> String {
+        format!("{}.{}", self.table_alias, self.column_name)
+    }
+    
+    /// Parse from string format "table.column"
+    pub fn from_string(s: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = s.split('.').collect();
+        if parts.len() != 2 {
+            return Err(format!("Invalid qualified column format: '{}'. Expected 'table.column'", s));
+        }
+        Ok(QualifiedColumn::new(parts[0].to_string(), parts[1].to_string()))
+    }
+}
+
+/// Legacy JoinInfo for backward compatibility during migration
+/// TODO: Remove after full migration to JoinEdge
 #[derive(Clone, Debug)]
 pub struct JoinInfo {
     pub left_table: String,
@@ -97,7 +161,17 @@ pub struct JoinInfo {
     pub join_type: JoinType,
 }
 
-#[derive(Clone, Debug)]
+impl From<JoinInfo> for JoinEdge {
+    fn from(info: JoinInfo) -> Self {
+        JoinEdge {
+            left: QualifiedColumn::new(info.left_table, info.left_column),
+            right: QualifiedColumn::new(info.right_table, info.right_column),
+            join_type: info.join_type,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum JoinType {
     Inner,
     Left,
@@ -227,8 +301,10 @@ pub fn extract_query_info(statement: &Statement) -> Result<ParsedQuery> {
                 let (limit, offset) = extract_limit_offset(query)?;
                 
                 Ok(ParsedQuery {
+                    where_expression: None, // Legacy parser doesn't support WHERE expression trees
                     tables,
                     columns,
+                    join_edges: vec![], // TODO: Extract join edges from joins
                     joins,
                     filters,
                     aggregates,
@@ -241,6 +317,7 @@ pub fn extract_query_info(statement: &Statement) -> Result<ParsedQuery> {
                     projection_expressions: vec![], // Old parser doesn't extract expressions
                     distinct: false, // TODO: Extract DISTINCT from SELECT
                     table_aliases: std::collections::HashMap::new(), // Old parser doesn't extract aliases
+                    derived_tables: std::collections::HashMap::new(),
                 })
             } else {
                 anyhow::bail!("Only SELECT queries are supported")

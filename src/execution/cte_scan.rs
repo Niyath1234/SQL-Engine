@@ -45,6 +45,10 @@ impl CTEScanOperator {
 }
 
 impl BatchIterator for CTEScanOperator {
+    fn prepare(&mut self) -> Result<(), anyhow::Error> {
+        Ok(()) // CTEScanOperator doesn't need prepare() yet
+    }
+    
     fn next(&mut self) -> Result<Option<ExecutionBatch>> {
         // If LIMIT is reached, return None
         if let Some(limit) = self.limit {

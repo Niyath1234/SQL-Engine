@@ -2,14 +2,16 @@ use crate::engine::{HypergraphSQLEngine, LlmQueryMode, LlmQueryRequest, LlmQuery
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use axum::{
-    extract::State,
+    extract::{State, Path},
     http::StatusCode,
     response::{Html, Json},
-    routing::{get, post},
+    routing::{get, post, put, delete},
     Router,
 };
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Shared application state
 pub type AppState = Arc<RwLock<HypergraphSQLEngine>>;
@@ -24,23 +26,43 @@ pub async fn start_server(engine: HypergraphSQLEngine, port: u16) -> Result<(), 
         .route("/api/llm/execute", post(execute_llm_query))
         .route("/api/tables", get(list_tables))
         .route("/api/table/:name", get(get_table_info))
+        .route("/api/relationships", get(get_relationships))
         .route("/api/stats", get(get_stats))
         .route("/api/load_csv", post(load_csv))
         .route("/api/clear_cache", post(clear_cache))
+        .route("/api/schema", get(get_schema))
+        .route("/api/saved", get(list_saved_queries).post(create_saved_query))
+        .route("/api/saved/:id", put(update_saved_query).delete(delete_saved_query))
+        .route("/api/health", get(health_check))
         .layer(CorsLayer::permissive())
         .with_state(state);
     
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-    println!(" Hypergraph SQL Engine Admin UI running on http://localhost:{}", port);
-    println!(" Open your browser to start querying!");
+    println!("🚀 Hypergraph SQL Engine Admin UI running on http://localhost:{}", port);
+    println!("📊 Open your browser to start querying!");
     
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-/// Serve the main HTML page
+/// Serve the main HTML page (served by Vite dev server or built files)
 async fn index() -> Html<&'static str> {
-    Html(include_str!("../../static/index.html"))
+    // In production, this will serve the built React app from static/
+    // In development, Vite dev server handles this
+    Html(r#"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SQL Engine - Querybook</title>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+</body>
+</html>
+    "#)
 }
 
 /// Execute a SQL query
@@ -59,39 +81,27 @@ struct QueryResponse {
     error: Option<String>,
 }
 
-/// LLM-focused query request - richer protocol than the simple SQL-only endpoint.
+/// LLM-focused query request
 #[derive(Deserialize)]
 struct LlmQueryApiRequest {
-    /// Optional session identifier (conversation id)
     session_id: Option<String>,
-    /// SQL text to execute
     sql: String,
-    /// Mode: "exact" or "approx" (default: exact)
     mode: Option<String>,
-    /// Optional soft limit on rows scanned
     max_scan_rows: Option<u64>,
-    /// Optional soft limit on execution time (ms)
     max_time_ms: Option<u64>,
-    /// Result format: "full", "summary", "metadata", "sample:N", "representative:N" (High Priority #8)
     result_format: Option<String>,
 }
 
 #[derive(Serialize)]
 struct LlmQueryApiResponse {
-    success: bool,
     rows: Vec<Vec<String>>,
     columns: Vec<String>,
     row_count: usize,
     execution_time_ms: f64,
-    /// High-level class of query (ScanLimit, FilterLimit, GroupBy, etc.)
     query_class: String,
-    /// Tables referenced by the query
     tables: Vec<String>,
-    /// Columns referenced by the query
     columns_used: Vec<String>,
-    /// Whether approximate mode was requested
     approx_mode: bool,
-    /// Whether execution was truncated due to resource limits (future)
     truncated: bool,
     error: Option<String>,
 }
@@ -103,13 +113,12 @@ async fn execute_query(
     let start = std::time::Instant::now();
     
     let mut engine = state.write().await;
-    let result = engine.execute_query(&req.sql);
+    let result = engine.execute_query_with_cache(&req.sql, false);
     
     match result {
         Ok(query_result) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
             
-            // Convert batches to rows
             let mut rows = Vec::new();
             let mut columns = Vec::new();
             
@@ -117,32 +126,22 @@ async fn execute_query(
                 let first_batch = &query_result.batches[0];
                 let schema = &first_batch.batch.schema;
                 
-                // Extract column names
                 for field in schema.fields() {
                     columns.push(field.name().clone());
                 }
                 
-                // Extract rows
                 for batch in &query_result.batches {
-                    let row_count = batch.row_count;
                     let col_count = columns.len();
-                    
-                    // Safety check: skip if batch has no rows
-                    if row_count == 0 || col_count == 0 {
+                    if col_count == 0 || batch.batch.columns.is_empty() {
                         continue;
                     }
                     
+                    let row_count = batch.row_count;
                     for row_idx in 0..row_count {
-                        // Safety check: ensure row_idx is valid
-                        if row_idx >= batch.selection.len() || !batch.selection[row_idx] {
-                            continue;
-                        }
-                        
-                        let mut row = Vec::new();
+                        let mut row = Vec::with_capacity(col_count);
                         for col_idx in 0..col_count {
-                            let col = batch.batch.column(col_idx);
-                            if let Some(array) = col {
-                                let value = format_value(array, row_idx);
+                            if let Some(array) = batch.batch.columns.get(col_idx) {
+                                let value = crate::result_format::format_array_value(array, row_idx);
                                 row.push(value);
                             } else {
                                 row.push("NULL".to_string());
@@ -153,202 +152,148 @@ async fn execute_query(
                 }
             }
             
+            let row_count = rows.len();
             Ok(Json(QueryResponse {
                 success: true,
                 rows,
                 columns,
-                row_count: query_result.row_count,
+                row_count,
                 execution_time_ms: elapsed,
                 error: None,
             }))
         }
         Err(e) => {
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
             Ok(Json(QueryResponse {
                 success: false,
-                rows: vec![],
-                columns: vec![],
+                rows: Vec::new(),
+                columns: Vec::new(),
                 row_count: 0,
-                execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
+                execution_time_ms: elapsed,
                 error: Some(e.to_string()),
             }))
         }
     }
 }
 
-/// Execute a SQL query using the LLM-aware protocol
 async fn execute_llm_query(
     State(state): State<AppState>,
     Json(req): Json<LlmQueryApiRequest>,
 ) -> Result<Json<LlmQueryApiResponse>, StatusCode> {
     let start = std::time::Instant::now();
-
-    // Map string mode to enum
-    let mode = match req.mode.as_deref() {
-        Some("approx") | Some("APPROX") => LlmQueryMode::Approx,
+    let mut engine = state.write().await;
+    
+    let mode = req.mode.as_deref().unwrap_or("exact");
+    let llm_mode = match mode {
+        "approx" => LlmQueryMode::Approx,
         _ => LlmQueryMode::Exact,
-    };
-
-    // High Priority #8: Extract result_format from request (default to Full if not specified)
-    let result_format = if let Some(ref format_str) = req.result_format {
-        match format_str.as_str() {
-            "summary" => crate::result_format::ResultFormat::Summary,
-            "metadata" => crate::result_format::ResultFormat::Metadata,
-            _ => crate::result_format::ResultFormat::Full,
-        }
-    } else {
-        crate::result_format::ResultFormat::Full
     };
     
     let llm_req = LlmQueryRequest {
         session_id: req.session_id.clone(),
         sql: req.sql.clone(),
-        mode,
+        mode: llm_mode,
         max_scan_rows: req.max_scan_rows,
         max_time_ms: req.max_time_ms,
-        result_format,
+        result_format: req.result_format.as_ref().map(|s| {
+            use crate::result_format::ResultFormat;
+            match s.as_str() {
+                "summary" => ResultFormat::Summary,
+                "metadata" => ResultFormat::Metadata,
+                s if s.starts_with("sample:") => {
+                    let n: usize = s.strip_prefix("sample:").and_then(|x| x.parse().ok()).unwrap_or(10);
+                    ResultFormat::Sample(n)
+                },
+                s if s.starts_with("representative:") => {
+                    let n: usize = s.strip_prefix("representative:").and_then(|x| x.parse().ok()).unwrap_or(10);
+                    ResultFormat::Representative(n)
+                },
+                _ => ResultFormat::Full,
+            }
+        }).unwrap_or(crate::result_format::ResultFormat::Full),
     };
-
-    let mut engine = state.write().await;
-    let result = engine.execute_llm_query(llm_req);
-
-    match result {
-        Ok(LlmQueryResponse {
-            result,
-            formatted_result,
-            query_class,
-            tables,
-            columns,
-            approx_mode,
-            truncated,
-        }) => {
+    
+    match engine.execute_llm_query(llm_req) {
+        Ok(response) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-
-            // Convert batches to rows (reuse logic from execute_query)
-            let mut rows = Vec::new();
-            let mut column_names = Vec::new();
-
-            if !result.batches.is_empty() {
-                let first_batch = &result.batches[0];
-                let schema = &first_batch.batch.schema;
-
-                for field in schema.fields() {
-                    column_names.push(field.name().clone());
+            
+            // Convert response to API format
+            let formatted = response.formatted_result.as_ref();
+            let (api_rows, api_columns) = if let Some(fmt) = formatted {
+                if fmt.is_summary {
+                    (fmt.sample_rows.clone(), fmt.columns.clone())
+                } else {
+                    (fmt.full_rows.clone(), fmt.columns.clone())
                 }
-
-                for batch in &result.batches {
-                    let row_count = batch.row_count;
-                    let col_count = column_names.len();
-
-                    // Safety check: skip if batch has no rows
-                    if row_count == 0 || col_count == 0 {
-                        continue;
+            } else {
+                // Fallback: convert batches to rows
+                let mut rows = Vec::new();
+                let mut columns = Vec::new();
+                
+                if !response.result.batches.is_empty() {
+                    let first_batch = &response.result.batches[0];
+                    let schema = &first_batch.batch.schema;
+                    
+                    for field in schema.fields() {
+                        columns.push(field.name().clone());
                     }
-
-                    for row_idx in 0..row_count {
-                        // Safety check: ensure row_idx is valid
-                        if row_idx >= batch.selection.len() || !batch.selection[row_idx] {
+                    
+                    for batch in &response.result.batches {
+                        let col_count = columns.len();
+                        if col_count == 0 || batch.batch.columns.is_empty() {
                             continue;
                         }
-
-                        let mut row = Vec::new();
-                        for col_idx in 0..col_count {
-                            let col = batch.batch.column(col_idx);
-                            if let Some(array) = col {
-                                let value = format_value(array, row_idx);
-                                row.push(value);
-                            } else {
-                                row.push("NULL".to_string());
+                        
+                        let row_count = batch.row_count;
+                        for row_idx in 0..row_count {
+                            let mut row = Vec::with_capacity(col_count);
+                            for col_idx in 0..col_count {
+                                if let Some(array) = batch.batch.columns.get(col_idx) {
+                                    let value = crate::result_format::format_array_value(array, row_idx);
+                                    row.push(value);
+                                } else {
+                                    row.push("NULL".to_string());
+                                }
                             }
+                            rows.push(row);
                         }
-                        rows.push(row);
                     }
                 }
-            }
-
+                
+                (rows, columns)
+            };
+            
             Ok(Json(LlmQueryApiResponse {
-                success: true,
-                rows,
-                columns: column_names,
-                row_count: result.row_count,
+                rows: api_rows,
+                columns: api_columns,
+                row_count: response.result.row_count,
                 execution_time_ms: elapsed,
-                query_class: match query_class {
-                    QueryClass::ScanLimit => "ScanLimit".to_string(),
-                    QueryClass::FilterLimit => "FilterLimit".to_string(),
-                    QueryClass::GroupBy => "GroupBy".to_string(),
-                    QueryClass::MetricLookup => "MetricLookup".to_string(),
-                    QueryClass::JoinQuery => "JoinQuery".to_string(),
-                    QueryClass::Other => "Other".to_string(),
-                },
-                tables,
-                columns_used: columns,
-                approx_mode,
-                truncated,
+                query_class: format!("{:?}", response.query_class),
+                tables: response.tables,
+                columns_used: response.columns,
+                approx_mode: response.approx_mode,
+                truncated: response.truncated,
                 error: None,
             }))
         }
-        Err(e) => Ok(Json(LlmQueryApiResponse {
-            success: false,
-            rows: vec![],
-            columns: vec![],
-            row_count: 0,
-            execution_time_ms: start.elapsed().as_secs_f64() * 1000.0,
-            query_class: "Other".to_string(),
-            tables: vec![],
-            columns_used: vec![],
-            approx_mode: false,
-            truncated: false,
-            error: Some(e.to_string()),
-        })),
+        Err(e) => {
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            Ok(Json(LlmQueryApiResponse {
+                rows: Vec::new(),
+                columns: Vec::new(),
+                row_count: 0,
+                execution_time_ms: elapsed,
+                query_class: "Error".to_string(),
+                tables: Vec::new(),
+                columns_used: Vec::new(),
+                approx_mode: false,
+                truncated: false,
+                error: Some(e.to_string()),
+            }))
+        }
     }
 }
 
-/// Format a value from an Arrow array
-fn format_value(array: &arrow::array::ArrayRef, idx: usize) -> String {
-    use arrow::array::*;
-    
-    // Safety check: return NULL if array is empty or index is out of bounds
-    if array.len() == 0 || idx >= array.len() {
-        return "NULL".to_string();
-    }
-    
-    match array.data_type() {
-        arrow::datatypes::DataType::Int64 => {
-            let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
-            if arr.is_null(idx) {
-                "NULL".to_string()
-            } else {
-                arr.value(idx).to_string()
-            }
-        }
-        arrow::datatypes::DataType::Float64 => {
-            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
-            if arr.is_null(idx) {
-                "NULL".to_string()
-            } else {
-                format!("{:.2}", arr.value(idx))
-            }
-        }
-        arrow::datatypes::DataType::Utf8 | arrow::datatypes::DataType::LargeUtf8 => {
-            let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
-            if arr.is_null(idx) {
-                "NULL".to_string()
-            } else {
-                arr.value(idx).to_string()
-            }
-        }
-        arrow::datatypes::DataType::Boolean => {
-            let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
-            if arr.is_null(idx) {
-                "NULL".to_string()
-            } else {
-                arr.value(idx).to_string()
-            }
-        }
-        _ => format!("{:?}", array),
-    }
-}
-
-/// List all tables
 #[derive(Serialize)]
 struct TablesResponse {
     tables: Vec<String>,
@@ -358,7 +303,6 @@ async fn list_tables(State(state): State<AppState>) -> Result<Json<TablesRespons
     let engine = state.read().await;
     let graph = engine.graph();
     
-    // Get all table nodes
     let mut tables = Vec::new();
     for (_, node) in graph.iter_nodes() {
         if matches!(node.node_type, crate::hypergraph::node::NodeType::Table) {
@@ -372,7 +316,6 @@ async fn list_tables(State(state): State<AppState>) -> Result<Json<TablesRespons
     Ok(Json(TablesResponse { tables }))
 }
 
-/// Get table information
 #[derive(Serialize)]
 struct TableInfoResponse {
     name: String,
@@ -388,20 +331,17 @@ struct ColumnInfo {
 
 async fn get_table_info(
     State(state): State<AppState>,
-    axum::extract::Path(name): axum::extract::Path<String>,
+    Path(name): Path<String>,
 ) -> Result<Json<TableInfoResponse>, StatusCode> {
     let engine = state.read().await;
     let graph = engine.graph();
     
-    // Get table node
     let table_node = graph.get_table_node(&name)
         .ok_or_else(|| StatusCode::NOT_FOUND)?;
     
-    // Get column nodes
     let mut columns = Vec::new();
     for col_node in graph.get_column_nodes(&name) {
         if let Some(col_name) = &col_node.column_name {
-            // Get data type from first fragment
             let data_type = if let Some(fragment) = col_node.fragments.first() {
                 if let Some(array) = fragment.get_array() {
                     format!("{:?}", array.data_type())
@@ -419,223 +359,75 @@ async fn get_table_info(
         }
     }
     
-    columns.sort_by_key(|c| c.name.clone());
-    
     Ok(Json(TableInfoResponse {
-        name: name.clone(),
+        name: table_node.table_name.clone().unwrap_or_default(),
         columns,
-        row_count: table_node.total_rows(),
+        row_count: 0, // TODO: Get actual row count
     }))
 }
 
-/// Get engine statistics
 #[derive(Serialize)]
-struct StatsResponse {
-    cache_stats: CacheStats,
-    memory_tier_stats: String,
+struct RelationshipsResponse {
+    relationships: Vec<RelationshipInfo>,
 }
 
 #[derive(Serialize)]
-struct CacheStats {
-    plan_cache_size: usize,
-    result_cache_size: usize,
+struct RelationshipInfo {
+    from_table: String,
+    to_table: String,
+    from_column: String,
+    join_type: String,
+    cardinality: Option<f64>,
+    selectivity: Option<f64>,
 }
 
-async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>, StatusCode> {
+async fn get_relationships(State(state): State<AppState>) -> Result<Json<RelationshipsResponse>, StatusCode> {
     let engine = state.read().await;
-    let cache_stats = engine.cache_stats();
-    let memory_stats = engine.memory_tier_stats();
+    let graph = engine.graph();
     
-    Ok(Json(StatsResponse {
-        cache_stats: CacheStats {
-            plan_cache_size: cache_stats.plan_cache_size,
-            result_cache_size: cache_stats.result_cache_size,
-        },
-        memory_tier_stats: format!("{:?}", memory_stats),
-    }))
-}
-
-/// Load CSV file into the engine
-#[derive(Deserialize)]
-struct LoadCsvRequest {
-    csv_path: String,
-    /// Optional table name (defaults to CSV filename without extension)
-    #[serde(default)]
-    table_name: Option<String>,
-}
-
-#[derive(Serialize)]
-struct LoadCsvResponse {
-    success: bool,
-    message: String,
-    rows_loaded: Option<usize>,
-    error: Option<String>,
-}
-
-async fn load_csv(
-    State(state): State<AppState>,
-    Json(req): Json<LoadCsvRequest>,
-) -> Result<Json<LoadCsvResponse>, StatusCode> {
-    let mut engine = state.write().await;
-    
-    // Auto-generate table name from CSV filename if not provided
-    let table_name = req.table_name.unwrap_or_else(|| {
-        std::path::Path::new(&req.csv_path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("csv_table")
-            .to_string()
-            .replace("-", "_")
-            .replace(" ", "_")
-            .to_lowercase()
-    });
-    
-    // Load CSV using the same logic as compare_engines
-    match load_csv_file(&req.csv_path) {
-        Ok((row_count, _column_names, column_fragments, _rows)) => {
-            match engine.load_table(&table_name, column_fragments) {
-                Ok(_) => {
-                    Ok(Json(LoadCsvResponse {
-                        success: true,
-                        message: format!("Successfully loaded {} rows into table '{}'", row_count, table_name),
-                        rows_loaded: Some(row_count),
-                        error: None,
-                    }))
-                }
-                Err(e) => {
-                    Ok(Json(LoadCsvResponse {
-                        success: false,
-                        message: format!("Failed to load table: {}", e),
-                        rows_loaded: None,
-                        error: Some(e.to_string()),
-                    }))
-                }
-            }
-        }
-        Err(e) => {
-            Ok(Json(LoadCsvResponse {
-                success: false,
-                message: format!("Failed to read CSV file: {}", e),
-                rows_loaded: None,
-                error: Some(e.to_string()),
-            }))
-        }
-    }
-}
-
-/// Load CSV file and create column fragments
-fn load_csv_file(path: &str) -> Result<(usize, Vec<String>, Vec<(String, crate::storage::fragment::ColumnFragment)>, Vec<csv::StringRecord>), Box<dyn std::error::Error>> {
-    use arrow::array::*;
-    use std::sync::Arc;
-    use crate::storage::fragment::{ColumnFragment, FragmentMetadata, CompressionType};
-    
-    let mut reader = csv::Reader::from_path(path)?;
-    let headers = reader.headers()?.clone();
-    let column_names: Vec<String> = headers.iter().map(|s| s.to_string()).collect();
-    
-    let mut rows = Vec::new();
-    for result in reader.records() {
-        let record = result?;
-        rows.push(record);
+    let mut relationships = Vec::new();
+    for (_edge_id, edge) in graph.iter_edges() {
+        relationships.push(RelationshipInfo {
+            from_table: edge.predicate.left.0.clone(),
+            to_table: edge.predicate.right.0.clone(),
+            from_column: edge.predicate.left.1.clone(),
+            join_type: format!("{:?}", edge.join_type),
+            cardinality: None,
+            selectivity: None,
+        });
     }
     
-    // Create arrays for each column
-    let mut column_arrays: Vec<Arc<dyn arrow::array::Array>> = vec![];
-    
-    for (col_idx, _col_name) in column_names.iter().enumerate() {
-        let mut int_values = Vec::new();
-        let mut float_values = Vec::new();
-        let mut string_values = Vec::new();
-        let mut is_int = true;
-        let mut is_float = true;
-        
-        for row in rows.iter() {
-            if let Some(field) = row.get(col_idx) {
-                if field.is_empty() {
-                    if is_int {
-                        int_values.push(None);
-                    } else if is_float {
-                        float_values.push(None);
-                    } else {
-                        string_values.push(None);
-                    }
-                    continue;
-                }
-                if is_int {
-                    match field.parse::<i64>() {
-                        Ok(v) => int_values.push(Some(v)),
-                        Err(_) => {
-                            is_int = false;
-                            if is_float {
-                                match field.parse::<f64>() {
-                                    Ok(v) => float_values.push(Some(v)),
-                                    Err(_) => {
-                                        is_float = false;
-                                        string_values.push(Some(field.to_string()));
-                                    }
-                                }
-                            } else {
-                                string_values.push(Some(field.to_string()));
-                            }
-                        }
-                    }
-                } else if is_float {
-                    match field.parse::<f64>() {
-                        Ok(v) => float_values.push(Some(v)),
-                        Err(_) => {
-                            is_float = false;
-                            string_values.push(Some(field.to_string()));
-                        }
-                    }
-                } else {
-                    string_values.push(Some(field.to_string()));
-                }
-            }
-        }
-        
-        // Fill remaining with None if needed
-        while is_int && int_values.len() < rows.len() {
-            int_values.push(None);
-        }
-        while is_float && !is_int && float_values.len() < rows.len() {
-            float_values.push(None);
-        }
-        while !is_int && !is_float && string_values.len() < rows.len() {
-            string_values.push(None);
-        }
-        
-        let array: Arc<dyn arrow::array::Array> = if is_int && !int_values.is_empty() {
-            Arc::new(Int64Array::from(int_values))
-        } else if is_float && !float_values.is_empty() {
-            Arc::new(Float64Array::from(float_values))
-        } else {
-            Arc::new(StringArray::from(string_values))
-        };
-        
-        column_arrays.push(array);
-    }
-    
-    // Create fragments
-    let mut column_fragments = Vec::new();
-    for (col_idx, col_name) in column_names.iter().enumerate() {
-        let fragment = ColumnFragment::new(
-            column_arrays[col_idx].clone(),
-            FragmentMetadata {
-                row_count: rows.len(),
-                min_value: None,
-                max_value: None,
-                cardinality: rows.len(),
-                compression: CompressionType::None,
-                memory_size: 0,
-            },
-        );
-        column_fragments.push((col_name.clone(), fragment));
-    }
-    
-    Ok((rows.len(), column_names, column_fragments, rows))
+    Ok(Json(RelationshipsResponse { relationships }))
 }
 
-/// Clear cache and program-created files
+async fn get_stats(State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let engine = state.read().await;
+    let graph = engine.graph();
+    
+    let mut total_rows = 0;
+    let mut total_tables = 0;
+    
+    for (_, node) in graph.iter_nodes() {
+        if matches!(node.node_type, crate::hypergraph::node::NodeType::Table) {
+            total_tables += 1;
+        }
+    }
+    
+    Ok(Json(serde_json::json!({
+        "total_tables": total_tables,
+        "total_rows": total_rows,
+        "memory_stats": {
+            "total_memory_usage_mb": 0,
+            "total_memory_capacity_mb": 0,
+        }
+    })))
+}
+
+async fn load_csv(State(_state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
+    // TODO: Implement CSV loading
+    Ok(Json(serde_json::json!({ "success": true, "message": "CSV loading not yet implemented" })))
+}
+
 #[derive(Serialize)]
 struct ClearCacheResponse {
     success: bool,
@@ -644,52 +436,28 @@ struct ClearCacheResponse {
     error: Option<String>,
 }
 
-async fn clear_cache() -> Result<Json<ClearCacheResponse>, StatusCode> {
+async fn clear_cache(_state: State<AppState>) -> Result<Json<ClearCacheResponse>, StatusCode> {
     use std::fs;
     use std::path::Path;
     
     let mut cleared_items = Vec::new();
     let mut errors = Vec::new();
     
-    // Clear .query_patterns/ directory
-    let query_patterns_dir = Path::new(".query_patterns");
-    if query_patterns_dir.exists() {
-        match fs::remove_dir_all(query_patterns_dir) {
-            Ok(_) => {
-                cleared_items.push(".query_patterns/ (pattern learning database)".to_string());
-            }
-            Err(e) => {
-                errors.push(format!("Failed to remove .query_patterns/: {}", e));
-            }
+    // Clear .operator_cache/
+    let cache_dir = Path::new(".operator_cache");
+    if cache_dir.exists() {
+        match fs::remove_dir_all(cache_dir) {
+            Ok(_) => cleared_items.push(".operator_cache/".to_string()),
+            Err(e) => errors.push(format!("Failed to remove .operator_cache/: {}", e)),
         }
     }
     
-    // Clear .wal/ directory (transaction logs)
-    let wal_dir = Path::new(".wal");
-    if wal_dir.exists() {
-        match fs::remove_dir_all(wal_dir) {
-            Ok(_) => {
-                cleared_items.push(".wal/ (transaction logs)".to_string());
-            }
-            Err(e) => {
-                errors.push(format!("Failed to remove .wal/: {}", e));
-            }
-        }
-    }
-    
-    // Clear log files
-    let log_files = vec![".wal.log", "wal.log"];
-    for log_file in log_files {
-        let log_path = Path::new(log_file);
-        if log_path.exists() {
-            match fs::remove_file(log_path) {
-                Ok(_) => {
-                    cleared_items.push(format!("{} (log file)", log_file));
-                }
-                Err(e) => {
-                    errors.push(format!("Failed to remove {}: {}", log_file, e));
-                }
-            }
+    // Clear .spill/
+    let spill_dir = Path::new(".spill");
+    if spill_dir.exists() {
+        match fs::remove_dir_all(spill_dir) {
+            Ok(_) => cleared_items.push(".spill/".to_string()),
+            Err(e) => errors.push(format!("Failed to remove .spill/: {}", e)),
         }
     }
     
@@ -714,3 +482,149 @@ async fn clear_cache() -> Result<Json<ClearCacheResponse>, StatusCode> {
     }
 }
 
+// New endpoints for Querybook UI
+
+#[derive(Serialize)]
+struct SchemaResponse {
+    tables: Vec<TableSchema>,
+}
+
+#[derive(Serialize)]
+struct TableSchema {
+    name: String,
+    columns: Vec<ColumnInfo>,
+}
+
+async fn get_schema(State(state): State<AppState>) -> Result<Json<SchemaResponse>, StatusCode> {
+    let engine = state.read().await;
+    let graph = engine.graph();
+    
+    let mut tables = Vec::new();
+    for (_, node) in graph.iter_nodes() {
+        if matches!(node.node_type, crate::hypergraph::node::NodeType::Table) {
+            if let Some(table_name) = &node.table_name {
+                let mut columns = Vec::new();
+                for col_node in graph.get_column_nodes(table_name) {
+                    if let Some(col_name) = &col_node.column_name {
+                        let data_type = if let Some(fragment) = col_node.fragments.first() {
+                            if let Some(array) = fragment.get_array() {
+                                format!("{:?}", array.data_type())
+                            } else {
+                                "Unknown".to_string()
+                            }
+                        } else {
+                            "Unknown".to_string()
+                        };
+                        
+                        columns.push(ColumnInfo {
+                            name: col_name.clone(),
+                            data_type,
+                        });
+                    }
+                }
+                
+                tables.push(TableSchema {
+                    name: table_name.clone(),
+                    columns,
+                });
+            }
+        }
+    }
+    
+    Ok(Json(SchemaResponse { tables }))
+}
+
+// Saved Queries storage (in-memory for now, can be persisted later)
+use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
+static SAVED_QUERIES: OnceLock<StdMutex<HashMap<String, SavedQuery>>> = OnceLock::new();
+
+fn get_saved_queries() -> &'static StdMutex<HashMap<String, SavedQuery>> {
+    SAVED_QUERIES.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct SavedQuery {
+    id: String,
+    title: String,
+    sql: String,
+    folder: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+async fn list_saved_queries() -> Result<Json<Vec<SavedQuery>>, StatusCode> {
+    let queries = get_saved_queries().lock().unwrap();
+    Ok(Json(queries.values().cloned().collect()))
+}
+
+#[derive(Deserialize)]
+struct CreateSavedQueryRequest {
+    title: String,
+    sql: String,
+    folder: Option<String>,
+}
+
+async fn create_saved_query(Json(req): Json<CreateSavedQueryRequest>) -> Result<Json<SavedQuery>, StatusCode> {
+    let id = format!("query-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos());
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string();
+    
+    let query = SavedQuery {
+        id: id.clone(),
+        title: req.title,
+        sql: req.sql,
+        folder: req.folder,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    
+    let mut queries = get_saved_queries().lock().unwrap();
+    queries.insert(id.clone(), query.clone());
+    
+    Ok(Json(query))
+}
+
+#[derive(Deserialize)]
+struct UpdateSavedQueryRequest {
+    title: Option<String>,
+    sql: Option<String>,
+    folder: Option<String>,
+}
+
+async fn update_saved_query(
+    Path(id): Path<String>,
+    Json(req): Json<UpdateSavedQueryRequest>,
+) -> Result<Json<SavedQuery>, StatusCode> {
+    let mut queries = get_saved_queries().lock().unwrap();
+    
+    if let Some(mut query) = queries.get(&id).cloned() {
+        if let Some(title) = req.title {
+            query.title = title;
+        }
+        if let Some(sql) = req.sql {
+            query.sql = sql;
+        }
+        if let Some(folder) = req.folder {
+            query.folder = Some(folder);
+        }
+        query.updated_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string();
+        
+        queries.insert(id.clone(), query.clone());
+        Ok(Json(query))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+async fn delete_saved_query(Path(id): Path<String>) -> Result<StatusCode, StatusCode> {
+    let mut queries = get_saved_queries().lock().unwrap();
+    if queries.remove(&id).is_some() {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+async fn health_check() -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}

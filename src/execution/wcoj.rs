@@ -281,6 +281,10 @@ impl WCOJJoinOperator {
 }
 
 impl BatchIterator for WCOJJoinOperator {
+    fn prepare(&mut self) -> Result<(), anyhow::Error> {
+        Ok(()) // WCOJJoinOperator doesn't need prepare() yet
+    }
+    
     fn next(&mut self) -> Result<Option<ExecutionBatch>> {
         if self.state.finished {
             return Ok(None);

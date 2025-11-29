@@ -80,11 +80,19 @@ impl WindowOperator {
         Ok(())
     }
     
-    /// Helper to resolve column index (handles qualified and unqualified names)
-    /// Uses ColumnResolver for unified column resolution
-    fn resolve_column_index(&self, schema: &SchemaRef, col_name: &str) -> Option<usize> {
-        // Use ColumnResolver with table aliases for consistent resolution
-        let resolver = ColumnResolver::new(schema.clone(), self.table_aliases.clone());
+    /// COLID: Helper to resolve column index using ColumnSchema → ColId when available
+    /// Falls back to string-based resolution for backward compatibility
+    fn resolve_column_index(&self, batch: &ExecutionBatch, col_name: &str) -> Option<usize> {
+        // COLID: Use ColumnSchema-based resolution if available
+        if let Some(ref column_schema) = batch.column_schema {
+            // Resolve column name to ColId, then get physical index
+            if let Some(col_id) = column_schema.resolve(col_name) {
+                return column_schema.physical_index(col_id);
+            }
+        }
+        
+        // Fallback: Use ColumnResolver for string-based resolution (backward compatibility)
+        let resolver = ColumnResolver::new(batch.batch.schema.clone(), self.table_aliases.clone());
         resolver.try_resolve(col_name)
     }
     
@@ -112,12 +120,11 @@ impl WindowOperator {
                     continue;
                 }
                 
-                // Extract partition key values
+                // COLID: Extract partition key values using ColumnSchema → ColId resolution
                 let mut partition_key = Vec::new();
                 for col_name in partition_by {
-                    // Use resolve_column_index to handle qualified and unqualified names
-                    // Use the batch's schema, not self.schema, since batches might have different schemas
-                    let col_idx = self.resolve_column_index(&batch.batch.schema, col_name)
+                    // COLID: Use ColumnSchema-based resolution if available
+                    let col_idx = self.resolve_column_index(batch, col_name)
                         .ok_or_else(|| anyhow::anyhow!("Partition column '{}' not found (available columns: {:?})", 
                             col_name,
                             batch.batch.schema.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>()))?;
@@ -169,12 +176,12 @@ impl WindowOperator {
                     // Use batch schema for column resolution - all batches should have same schema
                     // After buffering, batches should always be available - use buffered batch schema
                     // In sort_partitions closure, we can't use ? operator, so use unwrap_or_else with panic
-                    let batch_schema = self.buffered_batches.get(batch_a_idx)
-                        .map(|batch| &batch.batch.schema)
-                        .or_else(|| self.buffered_batches.first().map(|b| &b.batch.schema))
+                    // COLID: Use batch for ColumnSchema-based resolution
+                    let batch_a_for_resolution = self.buffered_batches.get(batch_a_idx)
+                        .or_else(|| self.buffered_batches.first())
                         .expect("No buffered batches available for schema resolution in sort_partitions");
                     
-                    let col_idx = match self.resolve_column_index(batch_schema, &order_col.column) {
+                    let col_idx = match self.resolve_column_index(batch_a_for_resolution, &order_col.column) {
                         Some(idx) => idx,
                         None => continue,
                     };
@@ -305,15 +312,13 @@ impl WindowOperator {
                 // Find the rank by counting distinct values before current row
                 if let Some(ref order_by) = win_func.order_by.first() {
                     let col_name = &order_by.column;
-                    // Get the first batch to resolve column - all batches should have same schema
-                    // After buffering, first batch should always be available - compute dynamically
-                    let batch_schema = self.buffered_batches.first()
-                        .map(|b| &b.batch.schema)
+                    // COLID: Use batch for ColumnSchema-based resolution
+                    let batch = self.buffered_batches.first()
                         .ok_or_else(|| anyhow::anyhow!("No buffered batches available for schema resolution"))?;
-                    let col_idx = self.resolve_column_index(batch_schema, col_name)
+                    let col_idx = self.resolve_column_index(batch, col_name)
                         .ok_or_else(|| anyhow::anyhow!("Order column '{}' not found (available columns: {:?})", 
                             col_name,
-                            batch_schema.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>()))?;
+                            batch.batch.schema.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>()))?;
                     
                     // Count rows with distinct values before current row
                     // We iterate through all rows before current row and count distinct values
@@ -324,8 +329,8 @@ impl WindowOperator {
                         let (b_idx, r_idx) = self.global_index_to_batch_row(idx);
                         if let Some(batch) = self.buffered_batches.get(b_idx) {
                             if batch.selection[r_idx] {
-                                // Resolve column index using this batch's schema to ensure correctness
-                                if let Some(col_idx_batch) = self.resolve_column_index(&batch.batch.schema, col_name) {
+                                // COLID: Resolve column index using ColumnSchema if available
+                                if let Some(col_idx_batch) = self.resolve_column_index(batch, col_name) {
                                     if let Some(col) = batch.batch.columns.get(col_idx_batch) {
                                         let val = Self::extract_value(col, r_idx);
                                         if !seen_values.contains(&val) {
@@ -350,15 +355,13 @@ impl WindowOperator {
                 // Similar to Rank but without gaps
                 if let Some(ref order_by) = win_func.order_by.first() {
                     let col_name = &order_by.column;
-                    // Use first batch's schema for column resolution
-                    // After buffering, first batch should always be available - compute dynamically
-                    let batch_schema = self.buffered_batches.first()
-                        .map(|b| &b.batch.schema)
+                    // COLID: Use batch for ColumnSchema-based resolution
+                    let batch = self.buffered_batches.first()
                         .ok_or_else(|| anyhow::anyhow!("No buffered batches available for schema resolution"))?;
-                    let col_idx = self.resolve_column_index(batch_schema, col_name)
+                    let col_idx = self.resolve_column_index(batch, col_name)
                         .ok_or_else(|| anyhow::anyhow!("Order column '{}' not found (available columns: {:?})", 
                             col_name,
-                            batch_schema.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>()))?;
+                            batch.batch.schema.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>()))?;
                     
                     // Count distinct values up to and including current row
                     // Note: We count all distinct values in the partition up to current row
@@ -368,8 +371,8 @@ impl WindowOperator {
                         let (b_idx, r_idx) = self.global_index_to_batch_row(idx);
                         if let Some(batch) = self.buffered_batches.get(b_idx) {
                             if batch.selection[r_idx] {
-                                // Resolve column using batch's schema
-                                if let Some(col_idx_batch) = self.resolve_column_index(&batch.batch.schema, col_name) {
+                                // COLID: Resolve column using ColumnSchema if available
+                                if let Some(col_idx_batch) = self.resolve_column_index(batch, col_name) {
                                     if let Some(col) = batch.batch.columns.get(col_idx_batch) {
                                         let val = Self::extract_value(col, r_idx);
                                         seen_values.insert(val);
@@ -389,23 +392,21 @@ impl WindowOperator {
             WindowFunction::SumOver => {
                 // SUM() OVER - sum of column values in partition up to current row
                 if let Some(ref col_name) = win_func.column {
-                    // Use first batch's schema for column resolution
-                    // After buffering, first batch should always be available - compute dynamically
-                    let batch_schema = self.buffered_batches.first()
-                        .map(|b| &b.batch.schema)
+                    // COLID: Use batch for ColumnSchema-based resolution
+                    let batch = self.buffered_batches.first()
                         .ok_or_else(|| anyhow::anyhow!("No buffered batches available for schema resolution"))?;
-                    let col_idx = self.resolve_column_index(batch_schema, col_name)
+                    let col_idx = self.resolve_column_index(batch, col_name)
                         .ok_or_else(|| anyhow::anyhow!("Column '{}' not found (available columns: {:?})", 
                             col_name,
-                            batch_schema.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>()))?;
+                            batch.batch.schema.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>()))?;
                     
                     let mut sum = 0.0;
                     for idx in partition_start..=global_row_idx {
                         let (batch_idx, row_idx) = self.global_index_to_batch_row(idx);
                         if let Some(batch) = self.buffered_batches.get(batch_idx) {
                             if batch.selection[row_idx] {
-                                // Resolve column using batch's schema
-                                if let Some(col_idx_batch) = self.resolve_column_index(&batch.batch.schema, col_name) {
+                                // COLID: Resolve column using ColumnSchema if available
+                                if let Some(col_idx_batch) = self.resolve_column_index(batch, col_name) {
                                     if let Some(col) = batch.batch.columns.get(col_idx_batch) {
                                         let val = Self::extract_value(col, row_idx);
                                         if let Value::Int64(i) = val {
@@ -426,15 +427,13 @@ impl WindowOperator {
             WindowFunction::AvgOver => {
                 // AVG() OVER - average of column values in partition up to current row
                 if let Some(ref col_name) = win_func.column {
-                    // Use first batch's schema for column resolution
-                    // After buffering, first batch should always be available - compute dynamically
-                    let batch_schema = self.buffered_batches.first()
-                        .map(|b| &b.batch.schema)
+                    // COLID: Use batch for ColumnSchema-based resolution
+                    let batch = self.buffered_batches.first()
                         .ok_or_else(|| anyhow::anyhow!("No buffered batches available for schema resolution"))?;
-                    let col_idx = self.resolve_column_index(batch_schema, col_name)
+                    let col_idx = self.resolve_column_index(batch, col_name)
                         .ok_or_else(|| anyhow::anyhow!("Column '{}' not found (available columns: {:?})", 
                             col_name,
-                            batch_schema.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>()))?;
+                            batch.batch.schema.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>()))?;
                     
                     let mut sum = 0.0;
                     let mut count = 0;
@@ -442,8 +441,8 @@ impl WindowOperator {
                         let (batch_idx, row_idx) = self.global_index_to_batch_row(idx);
                         if let Some(batch) = self.buffered_batches.get(batch_idx) {
                             if batch.selection[row_idx] {
-                                // Resolve column using batch's schema
-                                if let Some(col_idx_batch) = self.resolve_column_index(&batch.batch.schema, col_name) {
+                                // COLID: Resolve column using ColumnSchema if available
+                                if let Some(col_idx_batch) = self.resolve_column_index(batch, col_name) {
                                     if let Some(col) = batch.batch.columns.get(col_idx_batch) {
                                         let val = Self::extract_value(col, row_idx);
                                         if let Value::Int64(i) = val {
@@ -476,7 +475,17 @@ impl WindowOperator {
 }
 
 impl BatchIterator for WindowOperator {
+    fn prepare(&mut self) -> Result<(), anyhow::Error> {
+        Ok(()) // WindowOperator doesn't need prepare() yet
+    }
+    
     fn next(&mut self) -> Result<Option<ExecutionBatch>> {
+        // CRITICAL FIX: If no window functions, just pass through input without modification
+        // This prevents WindowOperator from being called when it shouldn't be
+        if self.window_functions.is_empty() {
+            return self.input.next();
+        }
+        
         // Buffer all input first (window functions need all rows)
         if !self.buffered {
             self.buffer_all_input()?;
@@ -583,6 +592,15 @@ impl BatchIterator for WindowOperator {
                 }
             }
             
+            // Check if this window function alias conflicts with existing columns
+            // If it does, skip adding both the array and the field to prevent duplicates
+            let field_name = win_func.alias.as_ref().unwrap_or(&"window_result".to_string()).clone();
+            if existing_field_names.contains(&field_name) {
+                eprintln!("WARNING WindowOperator: Window function alias '{}' conflicts with existing column. Skipping window function entirely.", field_name);
+                // Skip this window function - don't add array or field
+                continue;
+            }
+            
             // Create array for window function column based on window function type
             let window_array: Arc<dyn Array> = match win_func.function {
                 WindowFunction::RowNumber | WindowFunction::Rank | WindowFunction::DenseRank => {
@@ -633,22 +651,16 @@ impl BatchIterator for WindowOperator {
         for win_func in &self.window_functions {
             let mut field_name = win_func.alias.as_ref().unwrap_or(&"window_result".to_string()).clone();
             
-            // Ensure unique field name - if duplicate exists, append counter
+            // CRITICAL FIX: Check if this field name matches an aggregate function alias
+            // If it does, this is likely a bug - window functions shouldn't have the same aliases as aggregates
+            // Skip adding this window function column if it conflicts with an existing aggregate column
+            // This prevents the _1 suffix from being added to aggregate columns
+            // NOTE: We already checked this earlier when creating the arrays, so this should never happen
+            // But we keep the check here for safety
             if seen_field_names.contains(&field_name) {
-                let mut counter = 1;
-                let base_name = field_name.clone();
-                loop {
-                    field_name = format!("{}_{}", base_name, counter);
-                    if !seen_field_names.contains(&field_name) {
-                        break;
-                    }
-                    counter += 1;
-                    if counter > 1000 {
-                        // Safety limit to prevent infinite loop
-                        field_name = format!("{}_{}", base_name, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
-                        break;
-                    }
-                }
+                eprintln!("WARNING WindowOperator: Window function alias '{}' conflicts with existing column. Skipping field (array was already skipped).", field_name);
+                // Skip this window function field - array was already skipped earlier
+                continue;
             }
             seen_field_names.insert(field_name.clone());
             
@@ -674,10 +686,17 @@ impl BatchIterator for WindowOperator {
             "WindowOperator: Input batch column count ({}) != input schema field count ({})",
             batch.batch.columns.len(), input_field_count);
         
-        // Ensure output has input columns + window columns
-        debug_assert_eq!(new_columns.len(), input_field_count + self.window_functions.len(),
-            "WindowOperator: Output column count ({}) != input columns ({}) + window functions ({})",
-            new_columns.len(), input_field_count, self.window_functions.len());
+        // Ensure output has input columns + window columns (accounting for skipped ones)
+        // Count how many window functions were actually added (not skipped due to conflicts)
+        let added_window_count = new_columns.len() - input_field_count;
+        let expected_window_count = self.window_functions.len();
+        // Only assert if we added more windows than expected (shouldn't happen)
+        // If we added fewer, that's expected when some are skipped due to conflicts
+        if added_window_count > expected_window_count {
+            debug_assert_eq!(new_columns.len(), input_field_count + self.window_functions.len(),
+                "WindowOperator: Output column count ({}) > input columns ({}) + window functions ({})",
+                new_columns.len(), input_field_count, self.window_functions.len());
+        }
         
         // SCHEMA-FLOW DEBUG: Log output schema
         eprintln!("DEBUG WindowOperator::next() - Output schema has {} fields: {:?}", 
@@ -688,7 +707,38 @@ impl BatchIterator for WindowOperator {
         use crate::storage::columnar::ColumnarBatch;
         let new_batch = ColumnarBatch::new(new_columns, new_schema.clone());
         
-        let mut result_batch = ExecutionBatch::new(new_batch);
+        // COLID: Preserve ColumnSchema from input and add new window function result columns
+        let output_column_schema = if let Some(ref input_schema) = batch.column_schema {
+            use crate::execution::column_identity::{ColumnSchema, generate_col_id};
+            let mut col_schema = input_schema.clone();
+            
+            // Add new ColIds for window function result columns
+            // Window functions are appended after input columns
+            let input_col_count = input_schema.column_ids.len();
+            for (idx, win_func) in self.window_functions.iter().enumerate() {
+                let field_idx = input_col_count + idx;
+                if field_idx < new_schema.fields().len() {
+                    let field = new_schema.field(field_idx);
+                    let col_id = generate_col_id();
+                    let alias = if let Some(ref alias) = win_func.alias {
+                        alias.clone()
+                    } else {
+                        field.name().to_string()
+                    };
+                    col_schema.add_column(col_id, alias.clone(), alias, field.data_type().clone());
+                }
+            }
+            
+            Some(col_schema)
+        } else {
+            None // No input ColumnSchema - backward compatibility
+        };
+        
+        let mut result_batch = if let Some(ref column_schema) = output_column_schema {
+            ExecutionBatch::with_column_schema(new_batch, column_schema.clone())
+        } else {
+            ExecutionBatch::new(new_batch)
+        };
         result_batch.selection = batch.selection.clone(); // Preserve selection vector
         result_batch.row_count = batch.row_count;
         

@@ -12,6 +12,12 @@ pub mod tiered_index;
 pub mod compressed_execution;
 pub mod dictionary;
 pub mod statistics;
+pub mod tiered_optimization;
+pub mod tiered_cache;
+pub mod partitioning;
+pub mod btree_index;
+pub mod bitset;
+pub mod bitmap_index;
 
 pub use columnar::*;
 pub use fragment::*;
@@ -27,4 +33,9 @@ pub use tiered_index::*;
 pub use compressed_execution::*;
 pub use dictionary::*;
 pub use statistics::*;
+pub use tiered_optimization::*;
+pub use partitioning::*;
+pub use btree_index::*;
+pub use bitset::*;
+pub use bitmap_index::*;
 

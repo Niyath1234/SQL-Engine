@@ -114,8 +114,8 @@ pub fn format_results(
     }
 }
 
-/// Convert execution batches to rows
-fn batches_to_rows(result: &QueryResult, column_names: &[String]) -> Vec<Vec<String>> {
+/// Convert execution batches to rows (public for tests)
+pub fn batches_to_rows(result: &QueryResult, column_names: &[String]) -> Vec<Vec<String>> {
     let mut rows = Vec::new();
     
     for batch in &result.batches {
@@ -141,6 +141,16 @@ fn batches_to_rows(result: &QueryResult, column_names: &[String]) -> Vec<Vec<Str
     }
     
     rows
+}
+
+/// Format a single value from an array (public for tests and web server)
+pub fn format_value_for_test(array: &arrow::array::ArrayRef, idx: usize) -> String {
+    format_value(array, idx)
+}
+
+/// Alias for format_value_for_test (for backward compatibility)
+pub fn format_array_value(array: &arrow::array::ArrayRef, idx: usize) -> String {
+    format_value(array, idx)
 }
 
 /// Format a single value from an array

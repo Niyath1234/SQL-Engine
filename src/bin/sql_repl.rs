@@ -64,6 +64,8 @@ fn load_csv(path: &str) -> anyhow::Result<(usize, Vec<String>, Vec<(String, hype
                 cardinality: row_count,
                 compression: hypergraph_sql_engine::storage::fragment::CompressionType::None,
                 memory_size: 0,
+                table_name: None,
+                column_name: None,
             }
         );
         

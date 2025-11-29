@@ -154,6 +154,10 @@ impl SharedScanOperator {
             schema: arrow::datatypes::SchemaRef,
         }
         impl BatchIterator for SingleBatchIter {
+            fn prepare(&mut self) -> Result<(), anyhow::Error> {
+                Ok(()) // SingleBatchIter doesn't need prepare()
+            }
+            
             fn next(&mut self) -> Result<Option<ExecutionBatch>> {
                 Ok(self.batch.take())
             }

@@ -19,7 +19,10 @@ pub fn extract_query_info_enhanced(statement: &Statement) -> Result<ParsedQuery>
                 let tables = extract_tables_enhanced(select, &cte_context)?;
                 let columns = extract_columns_enhanced(select)?;
                 let joins = extract_joins_enhanced(select)?;
-                let filters = extract_filters_enhanced(select)?;
+                // Extract filters from main query AND from derived tables (subqueries in FROM)
+                let mut filters = extract_filters_enhanced(select)?;
+                let derived_table_filters = extract_derived_table_filters(select, &cte_context)?;
+                filters.extend(derived_table_filters);
                 let aggregates = extract_aggregates_enhanced(select)?;
                 let window_functions = extract_window_functions_enhanced(select)?;
                 let group_by = extract_group_by_enhanced(select)?;
@@ -36,11 +39,50 @@ pub fn extract_query_info_enhanced(statement: &Statement) -> Result<ParsedQuery>
                 // Extract table aliases from FROM/JOIN clauses
                 let table_aliases = extract_table_aliases(select, &cte_context)?;
                 
-                Ok(ParsedQuery {
+                // Extract WHERE expression tree if it has OR conditions
+                let where_expression = if let Some(where_clause) = &select.selection {
+                    // Check if WHERE has OR at top level (handle Nested expressions for parentheses)
+                    let top_level_expr = match where_clause {
+                        Expr::Nested(inner) => inner.as_ref(),
+                        _ => where_clause,
+                    };
+                    
+                    if let Expr::BinaryOp { op, .. } = top_level_expr {
+                        if matches!(op, sqlparser::ast::BinaryOperator::Or) {
+                            // Convert WHERE clause to Expression tree for OR handling
+                            use crate::query::ast_to_expression::sql_expr_to_expression;
+                            match sql_expr_to_expression(where_clause) {
+                                Ok(expr) => {
+                                    eprintln!("DEBUG parser: Successfully converted WHERE clause with OR to Expression tree: {:?}", expr);
+                                    Some(expr)
+                                },
+                                Err(e) => {
+                                    eprintln!("DEBUG parser: Failed to convert WHERE clause to Expression tree: {}", e);
+                                    None // Fallback to predicate-based filtering
+                                }
+                            }
+                        } else {
+                            eprintln!("DEBUG parser: WHERE clause does not have OR at top level (operator: {:?})", op);
+                            None
+                        }
+                    } else {
+                        eprintln!("DEBUG parser: WHERE clause is not a BinaryOp (type: {:?})", std::mem::discriminant(top_level_expr));
+                        None
+                    }
+                } else {
+                    None
+                };
+                
+                // Extract derived tables (subqueries in FROM)
+                let derived_tables = extract_derived_tables(select, &cte_context)?;
+                
+                let parsed = ParsedQuery {
                     tables,
                     columns,
+                    join_edges: vec![], // TODO: Extract join edges from joins
                     joins,
                     filters,
+                    where_expression,
                     aggregates,
                     window_functions,
                     group_by,
@@ -51,7 +93,16 @@ pub fn extract_query_info_enhanced(statement: &Statement) -> Result<ParsedQuery>
                     projection_expressions,
                     distinct,
                     table_aliases,
-                })
+                    derived_tables,
+                };
+                
+                // ==========================
+                // 1. PARSER OUTPUT
+                // ==========================
+                eprintln!("[DEBUG parser] columns = {:?}", parsed.columns);
+                eprintln!("[DEBUG parser] projection exprs = {:?}", parsed.projection_expressions);
+                
+                Ok(parsed)
             } else if let SetExpr::SetOperation { op, left, right, .. } = &*query.body {
                 // Handle UNION, INTERSECT, EXCEPT
                 // Parse left and right sides recursively
@@ -90,6 +141,10 @@ pub fn extract_query_info_enhanced(statement: &Statement) -> Result<ParsedQuery>
                 // Return a special ParsedQuery that indicates a set operation
                 // Store set operation info in a special way - we'll handle this in planner
                 let mut result = left_parsed;
+                // Ensure where_expression is set (use None for set operations)
+                if result.where_expression.is_none() {
+                    result.where_expression = None;
+                }
                 // Store set operation type in tables list (planner will detect and handle)
                 // sqlparser 0.40: SetOperator is an enum, check the actual variant
                 let set_op_str = match op {
@@ -128,12 +183,13 @@ fn extract_tables_enhanced(select: &Select, cte_context: &crate::query::cte::CTE
                 // Keep CTE tables in the list - planner will handle them as CTEScan
                 tables.push(table_name);
             }
-            TableFactor::Derived { subquery, alias: _, .. } => {
-                // Derived table (subquery in FROM) - extract tables from subquery
-                if let SetExpr::Select(subselect) = &*subquery.body {
-                    let sub_tables = extract_tables_enhanced(subselect, cte_context)?;
-                    tables.extend(sub_tables);
-                }
+            TableFactor::Derived { subquery, alias, .. } => {
+                // Derived table (subquery in FROM) - use the alias as the table name
+                // Don't extract underlying tables - the derived table will be executed separately
+                let table_alias = alias.as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| format!("derived_table_{}", tables.len()));
+                tables.push(table_alias);
             }
             TableFactor::TableFunction { .. } |
             TableFactor::UNNEST { .. } |
@@ -159,11 +215,12 @@ fn extract_tables_enhanced(select: &Select, cte_context: &crate::query::cte::CTE
                     // Keep CTE tables in the list - planner will handle them as CTEScan
                     tables.push(table_name);
                 }
-                TableFactor::Derived { subquery, .. } => {
-                    if let SetExpr::Select(subselect) = &*subquery.body {
-                        let sub_tables = extract_tables_enhanced(subselect, cte_context)?;
-                        tables.extend(sub_tables);
-                    }
+                TableFactor::Derived { subquery, alias, .. } => {
+                    // Derived table (subquery in JOIN) - use the alias as the table name
+                    let table_alias = alias.as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or_else(|| format!("derived_table_{}", tables.len()));
+                    tables.push(table_alias);
                 }
                 TableFactor::TableFunction { .. } |
                 TableFactor::UNNEST { .. } |
@@ -178,6 +235,154 @@ fn extract_tables_enhanced(select: &Select, cte_context: &crate::query::cte::CTE
     }
     
     Ok(tables)
+}
+
+/// Extract WHERE clauses from derived tables (subqueries in FROM) and convert them to filters
+/// These filters need to be applied to the underlying table scans
+fn extract_derived_table_filters(select: &Select, cte_context: &crate::query::cte::CTEContext) -> Result<Vec<FilterInfo>> {
+    let mut filters = vec![];
+    
+    // Extract from main FROM clause
+    for item in &select.from {
+        match &item.relation {
+            TableFactor::Derived { subquery, alias, .. } => {
+                if let SetExpr::Select(subselect) = &*subquery.body {
+                    // Extract WHERE clause from subquery
+                    if let Some(where_clause) = &subselect.selection {
+                        // Get the actual table name from the subquery (not the alias)
+                        // The filter should be applied to the actual table, not the alias
+                        let actual_table = extract_tables_enhanced(subselect, cte_context)
+                            .ok()
+                            .and_then(|t| t.first().cloned())
+                            .unwrap_or_else(|| "".to_string());
+                        
+                        if !actual_table.is_empty() {
+                            // Extract predicates from subquery WHERE clause
+                            // Map them to use the actual table name (not the alias)
+                            extract_predicates_with_table_alias(where_clause, &mut filters, &actual_table)?;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        
+        // Also check joins for derived tables
+        for join in &item.joins {
+            match &join.relation {
+                TableFactor::Derived { subquery, alias, .. } => {
+                    if let SetExpr::Select(subselect) = &*subquery.body {
+                        if let Some(where_clause) = &subselect.selection {
+                            // Get the actual table name from the subquery (not the alias)
+                            let actual_table = extract_tables_enhanced(subselect, cte_context)
+                                .ok()
+                                .and_then(|t| t.first().cloned())
+                                .unwrap_or_else(|| "".to_string());
+                            
+                            if !actual_table.is_empty() {
+                                extract_predicates_with_table_alias(where_clause, &mut filters, &actual_table)?;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    
+    Ok(filters)
+}
+
+/// Extract predicates from WHERE clause and map them to a specific table alias
+fn extract_predicates_with_table_alias(expr: &Expr, filters: &mut Vec<FilterInfo>, table_alias: &str) -> Result<()> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            match op {
+                sqlparser::ast::BinaryOperator::And => {
+                    extract_predicates_with_table_alias(left, filters, table_alias)?;
+                    extract_predicates_with_table_alias(right, filters, table_alias)?;
+                }
+                sqlparser::ast::BinaryOperator::Or => {
+                    // For OR, we still extract both sides but they'll be in the same filter list
+                    extract_predicates_with_table_alias(left, filters, table_alias)?;
+                    extract_predicates_with_table_alias(right, filters, table_alias)?;
+                }
+                _ => {
+                    // Single predicate - extract it
+                    extract_single_predicate_with_table_alias(expr, filters, table_alias)?;
+                }
+            }
+        }
+        _ => {
+            // Single predicate
+            extract_single_predicate_with_table_alias(expr, filters, table_alias)?;
+        }
+    }
+    Ok(())
+}
+
+/// Extract a single predicate and map it to a table alias
+fn extract_single_predicate_with_table_alias(expr: &Expr, filters: &mut Vec<FilterInfo>, table_alias: &str) -> Result<()> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            match op {
+                sqlparser::ast::BinaryOperator::Eq => {
+                    if let (Expr::CompoundIdentifier(left_cols), Expr::Value(right_val)) = (left.as_ref(), right.as_ref()) {
+                        let col_name = left_cols.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join(".");
+                        // If column doesn't have table prefix, add the table alias
+                        let (table, column) = if left_cols.len() > 1 {
+                            (left_cols[0].value.clone(), left_cols[1..].iter().map(|i| i.value.clone()).collect::<Vec<_>>().join("."))
+                        } else {
+                            (table_alias.to_string(), col_name)
+                        };
+                        
+                        let value = match right_val {
+                            sqlparser::ast::Value::Number(n, _) => n.clone(),
+                            sqlparser::ast::Value::SingleQuotedString(s) => s.clone(),
+                            sqlparser::ast::Value::DoubleQuotedString(s) => s.clone(),
+                            sqlparser::ast::Value::Boolean(b) => b.to_string(),
+                            _ => return Ok(()), // Skip unsupported value types
+                        };
+                        
+                        filters.push(FilterInfo {
+                            table,
+                            column,
+                            operator: crate::query::parser::FilterOperator::Equals,
+                            value,
+                            in_values: None,
+                            pattern: None,
+                            subquery_expression: None,
+                        });
+                    } else if let (Expr::Identifier(left_col), Expr::Value(right_val)) = (left.as_ref(), right.as_ref()) {
+                        // Column without table prefix - use table alias
+                        let value = match right_val {
+                            sqlparser::ast::Value::Number(n, _) => n.clone(),
+                            sqlparser::ast::Value::SingleQuotedString(s) => s.clone(),
+                            sqlparser::ast::Value::DoubleQuotedString(s) => s.clone(),
+                            sqlparser::ast::Value::Boolean(b) => b.to_string(),
+                            _ => return Ok(()),
+                        };
+                        
+                        filters.push(FilterInfo {
+                            table: table_alias.to_string(),
+                            column: left_col.value.clone(),
+                            operator: crate::query::parser::FilterOperator::Equals,
+                            value,
+                            in_values: None,
+                            pattern: None,
+                            subquery_expression: None,
+                        });
+                    }
+                }
+                _ => {
+                    // For other operators, try to extract similarly
+                    // This is a simplified version - full implementation would handle all operators
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn extract_columns_enhanced(select: &Select) -> Result<Vec<String>> {
@@ -253,6 +458,26 @@ fn extract_column_name_from_expr(expr: &Expr) -> Result<String> {
 fn extract_joins_enhanced(select: &Select) -> Result<Vec<JoinInfo>> {
     let mut joins = vec![];
     
+    // Track the current left table as we process joins
+    // Start with the first table from FROM clause
+    let mut current_left_table_alias: Option<String> = None;
+    
+    // Get the first table from FROM clause
+    if let Some(from_item) = select.from.first() {
+        match &from_item.relation {
+            TableFactor::Table { name, alias, .. } => {
+                current_left_table_alias = Some(
+                    alias.as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or_else(|| {
+                            name.0.iter().map(|ident| ident.value.clone()).collect::<Vec<_>>().join(".")
+                        })
+                );
+            }
+            _ => {}
+        }
+    }
+    
     for item in &select.from {
         for join in &item.joins {
             let join_type = match &join.join_operator {
@@ -263,8 +488,8 @@ fn extract_joins_enhanced(select: &Select) -> Result<Vec<JoinInfo>> {
                 _ => JoinType::Inner, // Default to Inner for other join types
             };
             
-            // Extract join condition
-            let (left_table, left_column, right_table, right_column) = match &join.join_operator {
+            // Extract join condition - this gives us the table aliases from the ON clause
+            let (left_table_from_on, left_column, right_table_from_on, right_column) = match &join.join_operator {
                 JoinOperator::Inner(join_constraint) |
                 JoinOperator::LeftOuter(join_constraint) |
                 JoinOperator::RightOuter(join_constraint) |
@@ -280,7 +505,8 @@ fn extract_joins_enhanced(select: &Select) -> Result<Vec<JoinInfo>> {
                             }
                             let col_name = columns[0].value.clone();
                             // For USING, we need table names from context
-                            // This is a simplified version
+                            // Use current_left_table_alias and the new join table
+                            let left_alias = current_left_table_alias.clone().unwrap_or_else(|| "left".to_string());
                             ("left".to_string(), col_name.clone(), "right".to_string(), col_name)
                         }
                         _ => continue,
@@ -289,21 +515,36 @@ fn extract_joins_enhanced(select: &Select) -> Result<Vec<JoinInfo>> {
                 _ => continue,
             };
             
-            // Get table name from join relation
-            let right_table_name = match &join.relation {
-                TableFactor::Table { name, .. } => {
-                    name.0.iter().map(|ident| ident.value.clone()).collect::<Vec<_>>().join(".")
+            // Get table name and alias from join relation (the right side of the join)
+            let right_table_alias = match &join.relation {
+                TableFactor::Table { name, alias, .. } => {
+                    // Prefer alias from table definition (e.g., "o" from "orders o")
+                    alias.as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or_else(|| {
+                            // No alias defined, use table name
+                            name.0.iter().map(|ident| ident.value.clone()).collect::<Vec<_>>().join(".")
+                        })
                 }
-                _ => right_table.clone(),
+                _ => right_table_from_on.clone(),
             };
             
+            // CRITICAL FIX: Use the current left table (from previous join or FROM clause)
+            // NOT always the first table from FROM clause
+            // The left table should be the table that was just joined (or first table for first join)
+            let left_table_alias = current_left_table_alias.clone()
+                .unwrap_or_else(|| left_table_from_on.clone());
+            
             joins.push(JoinInfo {
-                left_table,
+                left_table: left_table_alias.clone(),
                 left_column,
-                right_table: right_table_name,
+                right_table: right_table_alias.clone(),
                 right_column,
                 join_type,
             });
+            
+            // Update current_left_table_alias to be the right table (for next join)
+            current_left_table_alias = Some(right_table_alias);
         }
     }
     
@@ -372,10 +613,171 @@ fn extract_filters_enhanced(select: &Select) -> Result<Vec<FilterInfo>> {
     let mut filters = vec![];
     
     if let Some(where_clause) = &select.selection {
+        // Check if WHERE clause has top-level OR - if so, we need special handling
+        // For now, extract all predicates - FilterOperator will handle OR by evaluating
+        // the expression tree directly instead of flattening
         extract_predicates(where_clause, &mut filters)?;
     }
     
     Ok(filters)
+}
+
+/// Extract predicates preserving OR groups
+/// Returns filters with OR group markers
+fn extract_predicates_with_or_groups(expr: &Expr, filters: &mut Vec<FilterInfo>) -> Result<()> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            match op {
+                sqlparser::ast::BinaryOperator::Or => {
+                    // OR condition - extract left and right as separate groups
+                    // We'll mark them with a special marker to indicate OR groups
+                    // For now, extract both sides - FilterOperator will need to handle OR
+                    extract_predicates_with_or_groups(left, filters)?;
+                    extract_predicates_with_or_groups(right, filters)?;
+                }
+                sqlparser::ast::BinaryOperator::And => {
+                    // AND condition - extract both sides normally
+                    extract_predicates_with_or_groups(left, filters)?;
+                    extract_predicates_with_or_groups(right, filters)?;
+                }
+                _ => {
+                    // Comparison operator - extract as normal predicate
+                    extract_single_predicate(expr, filters)?;
+                }
+            }
+        }
+        _ => {
+            extract_single_predicate(expr, filters)?;
+        }
+    }
+    Ok(())
+}
+
+/// Extract a single predicate (comparison, LIKE, IN, etc.)
+fn extract_single_predicate(expr: &Expr, filters: &mut Vec<FilterInfo>) -> Result<()> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            // Comparison operator
+            if let Ok((table, column)) = extract_column_ref(left) {
+                let operator = match op {
+                    sqlparser::ast::BinaryOperator::Eq => FilterOperator::Equals,
+                    sqlparser::ast::BinaryOperator::NotEq => FilterOperator::NotEquals,
+                    sqlparser::ast::BinaryOperator::Lt => FilterOperator::LessThan,
+                    sqlparser::ast::BinaryOperator::LtEq => FilterOperator::LessThanOrEqual,
+                    sqlparser::ast::BinaryOperator::Gt => FilterOperator::GreaterThan,
+                    sqlparser::ast::BinaryOperator::GtEq => FilterOperator::GreaterThanOrEqual,
+                    _ => return Ok(()),
+                };
+                
+                let (value_str, subquery_expr) = match extract_literal_value(right.as_ref()) {
+                    Ok(v) => (v, None),
+                    Err(_) => {
+                        if matches!(right.as_ref(), Expr::Subquery(_)) {
+                            use crate::query::ast_to_expression::sql_expr_to_expression;
+                            match sql_expr_to_expression(right) {
+                                Ok(subquery_expression) => {
+                                    ("NULL".to_string(), Some(subquery_expression))
+                                }
+                                Err(e) => {
+                                    return Err(anyhow::anyhow!("Failed to parse subquery expression: {}", e));
+                                }
+                            }
+                        } else {
+                            let literal_value = match right.as_ref() {
+                                Expr::Identifier(ident) => ident.value.clone(),
+                                Expr::CompoundIdentifier(idents) => {
+                                    idents.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join(".")
+                                }
+                                _ => {
+                                    return Err(anyhow::anyhow!(
+                                        "Right side of comparison must be a literal value, identifier, or subquery. Use single quotes for string literals: 'value'."
+                                    ));
+                                }
+                            };
+                            (literal_value, None)
+                        }
+                    }
+                };
+                
+                filters.push(FilterInfo {
+                    table,
+                    column,
+                    operator,
+                    value: value_str,
+                    pattern: None,
+                    in_values: None,
+                    subquery_expression: subquery_expr,
+                });
+            }
+        }
+        Expr::Like { negated, expr, pattern, escape_char: _ } => {
+            if let Ok((table, column)) = extract_column_ref(expr) {
+                let pattern_val = extract_literal_value(pattern)?;
+                filters.push(FilterInfo {
+                    table,
+                    column,
+                    operator: if *negated { FilterOperator::NotLike } else { FilterOperator::Like },
+                    value: String::new(),
+                    pattern: Some(pattern_val),
+                    in_values: None,
+                    subquery_expression: None,
+                });
+            }
+        }
+        Expr::InList { expr, list, negated } => {
+            if let Ok((table, column)) = extract_column_ref(expr) {
+                let mut in_vals = Vec::new();
+                for item in list {
+                    if let Ok(val) = extract_literal_value(item) {
+                        in_vals.push(val);
+                    }
+                }
+                if !in_vals.is_empty() {
+                    filters.push(FilterInfo {
+                        table,
+                        column,
+                        operator: if *negated { FilterOperator::NotIn } else { FilterOperator::In },
+                        value: String::new(),
+                        pattern: None,
+                        in_values: Some(in_vals),
+                        subquery_expression: None,
+                    });
+                }
+            }
+        }
+        Expr::IsNull(expr) => {
+            if let Ok((table, column)) = extract_column_ref(expr) {
+                filters.push(FilterInfo {
+                    table,
+                    column,
+                    operator: FilterOperator::IsNull,
+                    value: String::new(),
+                    pattern: None,
+                    in_values: None,
+                    subquery_expression: None,
+                });
+            }
+        }
+        Expr::UnaryOp { op: sqlparser::ast::UnaryOperator::Not, expr: inner } => {
+            if let Expr::IsNull(inner_expr) = inner.as_ref() {
+                if let Ok((table, column)) = extract_column_ref(inner_expr) {
+                    filters.push(FilterInfo {
+                        table,
+                        column,
+                        operator: FilterOperator::IsNotNull,
+                        value: String::new(),
+                        pattern: None,
+                        in_values: None,
+                        subquery_expression: None,
+                    });
+                    return Ok(());
+                }
+            }
+            extract_single_predicate(inner, filters)?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn extract_predicates(expr: &Expr, filters: &mut Vec<FilterInfo>) -> Result<()> {
@@ -1080,107 +1482,82 @@ fn extract_order_by_enhanced(query: &Query) -> Result<Vec<OrderByInfo>> {
     };
     
     for item in &query.order_by {
-        // Use symbol table to resolve ORDER BY expression
-        // This implements proper name resolution with multiple strategies
-        
-        let column = match scope.resolve_order_by(&item.expr) {
-            Some(resolved) => {
-                // Successfully resolved via symbol table
-                resolved
+        // NEW FEATURE: Support position-based ORDER BY (ORDER BY 1, 2, ...)
+        // Check if ORDER BY expression is a numeric literal (position reference)
+        let column = if let Expr::Value(Value::Number(n, _)) = &item.expr {
+            // Position-based ORDER BY: ORDER BY 1 means first column, ORDER BY 2 means second, etc.
+            // Convert to 0-based index
+            if let Ok(pos) = n.parse::<usize>() {
+                if pos == 0 {
+                    // SQL uses 1-based indexing, so 0 is invalid
+                    anyhow::bail!("ORDER BY position must be >= 1, got 0");
+                }
+                let idx = pos - 1; // Convert to 0-based
+                
+                // Get column name from SELECT list at this position
+                if idx < scope.aliases.len() {
+                    // Use alias if available
+                    scope.aliases[idx].clone()
+                } else if idx < scope.select_items.len() {
+                    // Use alias from select_items
+                    scope.select_items[idx].1.clone()
+                } else {
+                    // Position out of range - use special marker that SortOperator will handle
+                    format!("__POSITION_{}__", pos)
+                }
+            } else {
+                // Failed to parse as number, fall through to normal resolution
+                scope.resolve_order_by(&item.expr).unwrap_or_else(|| {
+                    extract_column_name_from_expr(&item.expr)
+                        .unwrap_or_else(|_| format!("{:?}", item.expr))
+                })
             }
-            None => {
-                // Resolution failed - this means:
-                // 1. ORDER BY expr is not a simple identifier (total_value)
-                // 2. It's not matching any SELECT expression structurally
-                // 3. It might be a function call that sqlparser resolved from the alias
-                
-                // Fallback: extract column name if resolution fails
-                let extracted = extract_column_name_from_expr(&item.expr)
-                    .unwrap_or_else(|_| format!("{:?}", item.expr));
-                
-                // CRITICAL FIX: If extracted name is an aggregate function and we have aliases,
-                // use position-based matching or first alias
-                let extracted_upper = extracted.to_uppercase();
-                const AGGREGATE_FUNCTIONS: &[&str] = &["COUNT", "SUM", "AVG", "MIN", "MAX"];
-                
-                if AGGREGATE_FUNCTIONS.contains(&extracted_upper.as_str()) {
-                    // Try position-based matching first
-                    // For query: SELECT Year, SUM(Value) as total_value, ...
-                    // aggregate_index["SUM"] = 1, select_items[1] = (SUM(Value), "total_value")
-                    if let Some(&idx) = scope.aggregate_index.get(&extracted_upper) {
-                        if idx < scope.select_items.len() {
-                            // Found matching aggregate at position idx, return its alias
-                            scope.select_items[idx].1.clone()
-                        } else {
-                            // Index out of bounds, find first aggregate with matching function
-                            scope.select_items.iter()
-                                .find_map(|(expr, alias)| {
-                                    if let Expr::Function(func) = expr {
-                                        if func.name.to_string().to_uppercase() == extracted_upper {
-                                            Some(alias.clone())
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or_else(|| {
-                                    // No matching aggregate found, use first aggregate alias
-                                    scope.select_items.iter()
-                                        .find_map(|(expr, alias)| {
-                                            if let Expr::Function(_) = expr {
-                                                Some(alias.clone())
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .unwrap_or_else(|| {
-                                            // No aggregates at all, use first alias
-                                            if !scope.aliases.is_empty() {
-                                                scope.aliases[0].clone()
-                                            } else {
-                                                extracted
-                                            }
-                                        })
-                                })
-                        }
-                    } else {
-                        // No position match, find first aggregate with matching function name
-                        scope.select_items.iter()
-                            .find_map(|(expr, alias)| {
-                                if let Expr::Function(func) = expr {
-                                    if func.name.to_string().to_uppercase() == extracted_upper {
-                                        Some(alias.clone())
-                                    } else {
-                                        None
-                                    }
+        } else {
+            // Normal ORDER BY resolution (column name or expression)
+            match scope.resolve_order_by(&item.expr) {
+                Some(resolved) => {
+                    // Successfully resolved via symbol table
+                    resolved
+                }
+                None => {
+                    // Resolution failed - this means:
+                    // 1. ORDER BY expr is not a simple identifier (total_value)
+                    // 2. It's not matching any SELECT expression structurally
+                    // 3. It might be a function call that sqlparser resolved from the alias
+                    
+                    // ENHANCEMENT: Try to match function expressions directly
+                    // This handles: SELECT AVG(salary) AS avg_sal ... ORDER BY AVG(salary)
+                    if let Expr::Function(order_func) = &item.expr {
+                        let func_name = order_func.name.to_string().to_uppercase();
+                        
+                        // Try to find matching function in SELECT list by structural matching
+                        if let Some(matching_alias) = scope.select_items.iter().find_map(|(expr, alias)| {
+                            // Check if this SELECT expression is a function with the same name
+                            if let Expr::Function(select_func) = expr {
+                                let select_func_name = select_func.name.to_string().to_uppercase();
+                                
+                                // If function names match, this is a match
+                                // Also try structural matching for more complex cases
+                                if func_name == select_func_name || expressions_match(&item.expr, expr) {
+                                    Some(alias.clone())
                                 } else {
                                     None
                                 }
-                            })
-                            .unwrap_or_else(|| {
-                                // No matching function, use first aggregate alias
-                                scope.select_items.iter()
-                                    .find_map(|(expr, alias)| {
-                                        if let Expr::Function(_) = expr {
-                                            Some(alias.clone())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .unwrap_or_else(|| {
-                                        // No aggregates, use first alias
-                                        if !scope.aliases.is_empty() {
-                                            scope.aliases[0].clone()
-                                        } else {
-                                            extracted
-                                        }
-                                    })
-                            })
+                            } else {
+                                None
+                            }
+                        }) {
+                            matching_alias
+                        } else {
+                            // Fallback: extract column name if resolution fails
+                            extract_column_name_from_expr(&item.expr)
+                                .unwrap_or_else(|_| format!("{:?}", item.expr))
+                        }
+                    } else {
+                        // Fallback: extract column name if resolution fails
+                        extract_column_name_from_expr(&item.expr)
+                            .unwrap_or_else(|_| format!("{:?}", item.expr))
                     }
-                } else {
-                    extracted
                 }
             }
         };
@@ -1506,6 +1883,47 @@ fn extract_table_aliases(select: &Select, cte_context: &crate::query::cte::CTECo
     }
     
     Ok(aliases)
+}
+
+/// Extract derived tables (subqueries in FROM) with their aliases
+fn extract_derived_tables(select: &Select, cte_context: &crate::query::cte::CTEContext) -> Result<std::collections::HashMap<String, sqlparser::ast::Query>> {
+    let mut derived_tables = std::collections::HashMap::new();
+    
+    // Extract from main FROM clause
+    for item in &select.from {
+        match &item.relation {
+            TableFactor::Derived { subquery, alias, .. } => {
+                let table_alias = alias.as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| {
+                        // Generate a default alias if none provided
+                        format!("derived_table_{}", derived_tables.len())
+                    });
+                
+                // Store the full subquery AST
+                derived_tables.insert(table_alias, *subquery.clone());
+            }
+            _ => {}
+        }
+        
+        // Also check joins for derived tables
+        for join in &item.joins {
+            match &join.relation {
+                TableFactor::Derived { subquery, alias, .. } => {
+                    let table_alias = alias.as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or_else(|| {
+                            format!("derived_table_{}", derived_tables.len())
+                        });
+                    
+                    derived_tables.insert(table_alias, *subquery.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    
+    Ok(derived_tables)
 }
 
 

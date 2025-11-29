@@ -3,9 +3,9 @@ use arrow::datatypes::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use bitvec::prelude::*;
-use std::hash::{Hash, Hasher};
 use memmap2::Mmap;
 use crate::execution::batch::ExecutionBatch;
+use crate::storage::bitmap_index::BitmapIndex as NewBitmapIndex;
 
 /// Represents a column fragment - a chunk of columnar data
 /// Optimized for cache locality and SIMD operations
@@ -30,7 +30,7 @@ pub struct ColumnFragment {
     pub bloom_filter: Option<Vec<u8>>,
     
     /// Bitmap index for equality predicates (columnar bitmaps)
-    pub bitmap_index: Option<BitmapIndex>,
+    pub bitmap_index: Option<NewBitmapIndex>,
     
     /// Whether this fragment is sorted (enables binary search)
     pub is_sorted: bool,
@@ -69,6 +69,14 @@ pub struct FragmentMetadata {
     
     /// Memory size in bytes
     pub memory_size: usize,
+    
+    /// Table name (for bitmap index building)
+    #[serde(default)]
+    pub table_name: Option<String>,
+    
+    /// Column name (for bitmap index building)
+    #[serde(default)]
+    pub column_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,8 +90,10 @@ pub enum CompressionType {
     Lz4,
 }
 
-/// Bitmap index for fast equality lookups
+/// Legacy bitmap index for fast equality lookups (deprecated - use bitmap_index::BitmapIndex instead)
+/// This is kept for backward compatibility but should not be used in new code
 #[derive(Clone, Debug)]
+#[deprecated(note = "Use crate::storage::bitmap_index::BitmapIndex instead")]
 pub struct BitmapIndex {
     /// Map from value hash to bitmap of row positions
     pub bitmaps: dashmap::DashMap<u64, BitVec>,
@@ -115,6 +125,58 @@ impl std::fmt::Display for Value {
             Value::Bool(v) => write!(f, "{}", v),
             Value::Vector(v) => write!(f, "[{}]", v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ")),
             Value::Null => write!(f, "NULL"),
+        }
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Int64(a), Value::Int64(b)) => a == b,
+            (Value::Int32(a), Value::Int32(b)) => a == b,
+            (Value::Float64(a), Value::Float64(b)) => ordered_float::OrderedFloat(*a) == ordered_float::OrderedFloat(*b),
+            (Value::Float32(a), Value::Float32(b)) => ordered_float::OrderedFloat(*a) == ordered_float::OrderedFloat(*b),
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Null, Value::Null) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Value {}
+
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Value {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Value::Int64(a), Value::Int64(b)) => a.cmp(b),
+            (Value::Int32(a), Value::Int32(b)) => a.cmp(b),
+            (Value::Float64(a), Value::Float64(b)) => ordered_float::OrderedFloat(*a).cmp(&ordered_float::OrderedFloat(*b)),
+            (Value::Float32(a), Value::Float32(b)) => ordered_float::OrderedFloat(*a).cmp(&ordered_float::OrderedFloat(*b)),
+            (Value::String(a), Value::String(b)) => a.cmp(b),
+            (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+            (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+            // Type-based ordering: Int64 < Int32 < Float64 < Float32 < String < Bool < Null < Vector
+            (Value::Int64(_), _) => std::cmp::Ordering::Less,
+            (Value::Int32(_), Value::Int64(_)) => std::cmp::Ordering::Greater,
+            (Value::Int32(_), _) => std::cmp::Ordering::Less,
+            (Value::Float64(_), Value::Int64(_) | Value::Int32(_)) => std::cmp::Ordering::Greater,
+            (Value::Float64(_), _) => std::cmp::Ordering::Less,
+            (Value::Float32(_), Value::Int64(_) | Value::Int32(_) | Value::Float64(_)) => std::cmp::Ordering::Greater,
+            (Value::Float32(_), _) => std::cmp::Ordering::Less,
+            (Value::String(_), Value::Int64(_) | Value::Int32(_) | Value::Float64(_) | Value::Float32(_)) => std::cmp::Ordering::Greater,
+            (Value::String(_), _) => std::cmp::Ordering::Less,
+            (Value::Bool(_), Value::Vector(_) | Value::Null) => std::cmp::Ordering::Less,
+            (Value::Bool(_), _) => std::cmp::Ordering::Greater,
+            (Value::Null, Value::Vector(_)) => std::cmp::Ordering::Less,
+            (Value::Null, _) => std::cmp::Ordering::Greater,
+            (Value::Vector(_), _) => std::cmp::Ordering::Greater,
         }
     }
 }
@@ -162,61 +224,8 @@ impl std::hash::Hash for Value {
     }
 }
 
-impl std::cmp::PartialEq for Value {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Value::Int64(a), Value::Int64(b)) => a == b,
-            (Value::Int32(a), Value::Int32(b)) => a == b,
-            (Value::Float64(a), Value::Float64(b)) => a == b,
-            (Value::Float32(a), Value::Float32(b)) => a == b,
-            (Value::String(a), Value::String(b)) => a == b,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Vector(a), Value::Vector(b)) => a == b,
-            (Value::Null, Value::Null) => true,
-            _ => false,
-        }
-    }
-}
-
-impl std::cmp::Eq for Value {}
-
-// PartialOrd implementation (floats use ordered_float for NaN handling)
-impl std::cmp::PartialOrd for Value {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        match (self, other) {
-            (Value::Int64(a), Value::Int64(b)) => a.partial_cmp(b),
-            (Value::Int32(a), Value::Int32(b)) => a.partial_cmp(b),
-            (Value::Float64(a), Value::Float64(b)) => {
-                use ordered_float::OrderedFloat;
-                OrderedFloat(*a).partial_cmp(&OrderedFloat(*b))
-            }
-            (Value::Float32(a), Value::Float32(b)) => {
-                use ordered_float::OrderedFloat;
-                OrderedFloat(*a).partial_cmp(&OrderedFloat(*b))
-            }
-            (Value::String(a), Value::String(b)) => a.partial_cmp(b),
-            (Value::Bool(a), Value::Bool(b)) => a.partial_cmp(b),
-            (Value::Vector(a), Value::Vector(b)) => {
-                // Compare vectors by length first, then element-wise
-                match a.len().cmp(&b.len()) {
-                    std::cmp::Ordering::Equal => {
-                        // Compare element-wise
-                        for (x, y) in a.iter().zip(b.iter()) {
-                            match x.partial_cmp(y) {
-                                Some(std::cmp::Ordering::Equal) => continue,
-                                other => return other,
-                            }
-                        }
-                        Some(std::cmp::Ordering::Equal)
-                    }
-                    other => Some(other),
-                }
-            }
-            (Value::Null, Value::Null) => Some(std::cmp::Ordering::Equal),
-            _ => None,
-        }
-    }
-}
+// Trait implementations for Value already exist above (lines 122-172)
+// No need to duplicate them here
 
 impl ColumnFragment {
     pub fn new(array: Arc<dyn Array>, metadata: FragmentMetadata) -> Self {
@@ -500,68 +509,61 @@ impl ColumnFragment {
         self.bloom_filter = Some(bloom_bits);
     }
     
-    /// Build bitmap index for this fragment
-    /// Bitmap index provides fast equality lookups (can quickly find all rows with a specific value)
-    pub fn build_bitmap_index(&mut self) {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+    /// Build bitmap index for this fragment using the new BitmapIndex structure
+    /// Bitmap index maps each distinct value to a bitset of row IDs where that value appears
+    pub fn build_bitmap_index_new(&mut self) -> anyhow::Result<()> {
+        use crate::execution::operators::extract_value;
         
         // Get array to build bitmap index from
         let array = match self.get_array() {
             Some(arr) => arr,
-            None => return, // Can't build bitmap index without array
+            None => return Ok(()), // Can't build bitmap index without array
         };
         
         let row_count = array.len();
         if row_count == 0 {
-            return;
+            return Ok(());
         }
         
-        // Create bitmap index
-        let mut bitmap_index = BitmapIndex {
-            bitmaps: dashmap::DashMap::new(),
-            row_count,
-        };
+        // Get table and column name from metadata
+        let table_name = self.metadata.table_name.clone().unwrap_or_else(|| "unknown".to_string());
+        let column_name = self.metadata.column_name.clone().unwrap_or_else(|| "unknown".to_string());
         
-        // For each value in the array, create or update bitmap
-        for i in 0..row_count {
-            if array.is_null(i) {
-                continue; // Skip nulls in bitmap index
+        // Create bitmap index using the new type
+        let mut bitmap_index = NewBitmapIndex::new(table_name, column_name);
+        
+        // Build index by iterating through all rows
+        for row_id in 0..row_count {
+            if array.is_null(row_id) {
+                continue; // Skip nulls
             }
             
-            // Create a hash of the value for the bitmap key
-            let mut hasher = DefaultHasher::new();
-            match array.data_type() {
-                DataType::Int64 => {
-                    if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
-                        arr.value(i).hash(&mut hasher);
-                    }
+            // Extract value from array
+            match extract_value(&array, row_id) {
+                Ok(value) => {
+                    bitmap_index.add_value(value, row_id);
                 }
-                DataType::Float64 => {
-                    if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
-                        arr.value(i).to_bits().hash(&mut hasher);
-                    }
+                Err(_) => {
+                    // Skip rows where value extraction fails
+                    continue;
                 }
-                DataType::Utf8 => {
-                    if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
-                        arr.value(i).hash(&mut hasher);
-                    }
-                }
-                _ => continue, // Unsupported type
             }
-            
-            let value_hash = hasher.finish();
-            
-            // Get or create bitmap for this value
-            bitmap_index.bitmaps
-                .entry(value_hash)
-                .or_insert_with(|| bitvec![0; row_count])
-                .set(i, true);
         }
         
-        // Only set bitmap index if we created at least one bitmap
-        if !bitmap_index.bitmaps.is_empty() {
-            self.bitmap_index = Some(bitmap_index);
+        // Store bitmap index in fragment
+        self.bitmap_index = Some(bitmap_index);
+        
+        Ok(())
+    }
+    
+    /// Build bitmap index for this fragment (legacy method - use build_bitmap_index_new instead)
+    /// Bitmap index provides fast equality lookups (can quickly find all rows with a specific value)
+    /// This method is deprecated - use build_bitmap_index_new() which uses the new BitmapIndex type
+    #[deprecated(note = "Use build_bitmap_index_new() instead")]
+    pub fn build_bitmap_index(&mut self) {
+        // Delegate to the new implementation
+        if let Err(e) = self.build_bitmap_index_new() {
+            eprintln!("Warning: Failed to build bitmap index: {}", e);
         }
     }
 }

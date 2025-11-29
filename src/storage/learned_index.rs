@@ -1,7 +1,6 @@
 /// Learned Indexes - Using ML models to predict data positions
 /// Based on "The Case for Learned Index Structures" (Kraska et al., 2018)
 use crate::storage::fragment::{ColumnFragment, Value};
-use bitvec::prelude::*;
 use std::collections::HashMap;
 use ordered_float::OrderedFloat;
 

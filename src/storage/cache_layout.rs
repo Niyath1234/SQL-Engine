@@ -167,6 +167,8 @@ impl CacheOptimizedFragmentBuilder {
                 cardinality: header.distinct_count,
                 compression: compression_type,
                 memory_size,
+                table_name: None,
+                column_name: None,
             };
             
             // Create fragment with cache-aligned layout

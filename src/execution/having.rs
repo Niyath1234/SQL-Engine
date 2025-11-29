@@ -52,6 +52,10 @@ impl HavingOperator {
 }
 
 impl BatchIterator for HavingOperator {
+    fn prepare(&mut self) -> Result<(), anyhow::Error> {
+        Ok(()) // HavingOperator doesn't need prepare() yet
+    }
+    
     fn next(&mut self) -> Result<Option<ExecutionBatch>> {
         let batch = match self.input.next()? {
             Some(b) => b,

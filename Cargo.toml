@@ -36,10 +36,18 @@ fxhash = "0.2" # Fast hash functions
 ordered-float = "2" # Ordered floats for sorting
 regex = "1"    # Pattern matching for LIKE operator
 rand = "0.8"   # Random number generation for HNSW level assignment
+itertools = "0.12" # Iterator utilities
+dirs = "5.0"   # Directory utilities for finding user data dir
+uuid = { version = "1.0", features = ["v4"] } # UUID generation for spill files
+num_cpus = "1.16" # CPU count detection for predictive spill
+tempfile = "3.8" # Temporary directory for tests
 
 # Error Handling
 anyhow = "1"
 thiserror = "1"
+
+# WASM JIT Compilation
+wasmtime = "23.0"
 
 # Async runtime (needed for PostgreSQL and DuckDB)
 tokio = { version = "1", features = ["full"] }
@@ -73,6 +81,10 @@ name = "compare_engines"
 path = "src/bin/compare_engines.rs"
 
 [[bin]]
+name = "test_features"
+path = "src/bin/test_features.rs"
+
+[[bin]]
 name = "web_admin"
 path = "src/bin/web_admin.rs"
 
@@ -84,33 +96,35 @@ path = "src/bin/sql_repl.rs"
 name = "benchmark"
 path = "src/bin/benchmark.rs"
 
-[[bin]]
-name = "verify_features"
-path = "verify_features.rs"
 
-[[bin]]
-name = "test_join_minimal"
-path = "test_join_minimal.rs"
+# Removed binary targets for non-existent test files
+# [[bin]]
+# name = "verify_features"
+# path = "verify_features.rs"
 
-[[bin]]
-name = "test_join_simple"
-path = "test_join_simple.rs"
+# [[bin]]
+# name = "test_join_minimal"
+# path = "test_join_minimal.rs"
 
-[[bin]]
-name = "test_join_demo"
-path = "test_join_demo.rs"
+# [[bin]]
+# name = "test_join_simple"
+# path = "test_join_simple.rs"
 
-[[bin]]
-name = "test_multi_join"
-path = "test_multi_join.rs"
+# [[bin]]
+# name = "test_join_demo"
+# path = "test_join_demo.rs"
 
-[[bin]]
-name = "test_complex_query"
-path = "test_complex_query.rs"
+# [[bin]]
+# name = "test_multi_join"
+# path = "test_multi_join.rs"
 
-[[bin]]
-name = "test_complex_queries_suite"
-path = "test_complex_queries_suite.rs"
+# [[bin]]
+# name = "test_complex_query"
+# path = "test_complex_query.rs"
+
+# [[bin]]
+# name = "test_complex_queries_suite"
+# path = "test_complex_queries_suite.rs"
 
 # Temporarily disabled - uses old APIs
 # [[bin]]

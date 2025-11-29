@@ -275,14 +275,18 @@ impl SubqueryExecutor for DefaultSubqueryExecutor {
         let parsed = extract_query_info_enhanced(&ast)?;
         
         // Plan the subquery
-        let subquery_plan = self.planner.plan_with_ast(&parsed, Some(&ast))?;
+        // Create a mutable planner for planning (planner.plan_with_ast requires &mut)
+        // Note: Subqueries don't have CTE context - they're executed independently
+        let mut planner_for_planning = QueryPlanner::from_arc_with_options(self.graph.clone(), false);
+        let subquery_plan = planner_for_planning.plan_with_ast(&parsed, Some(&ast))?;
         
         // Execute the subquery (create engine instance)
         // Pass self as subquery executor for nested subqueries
         let engine = self.create_engine();
         let executor = Arc::new(DefaultSubqueryExecutor::with_graph(
             self.graph.clone(),
-            self.planner.clone(),
+            // Create new planner (planner is not Clone)
+            QueryPlanner::from_arc_with_options(self.graph.clone(), false),
         ));
         eprintln!("DEBUG subquery executor: Executing subquery with outer_context.is_some()={}", outer_context.is_some());
         let result = engine.execute_with_subquery_executor(
@@ -378,14 +382,18 @@ impl SubqueryExecutor for DefaultSubqueryExecutor {
         let parsed = extract_query_info_enhanced(&ast)?;
         
         // Plan the subquery
-        let subquery_plan = self.planner.plan_with_ast(&parsed, Some(&ast))?;
+        // Create a mutable planner for planning (planner.plan_with_ast requires &mut)
+        // Note: Subqueries don't have CTE context - they're executed independently
+        let mut planner_for_planning = QueryPlanner::from_arc_with_options(self.graph.clone(), false);
+        let subquery_plan = planner_for_planning.plan_with_ast(&parsed, Some(&ast))?;
         
         // Execute the subquery with LIMIT 1 for optimization (create engine instance)
         // Pass self as subquery executor for nested subqueries
         let engine = self.create_engine();
         let executor = Arc::new(DefaultSubqueryExecutor::with_graph(
             self.graph.clone(),
-            self.planner.clone(),
+            // Create new planner (planner is not Clone)
+            QueryPlanner::from_arc_with_options(self.graph.clone(), false),
         ));
         let result = engine.execute_with_subquery_executor(
             &subquery_plan,

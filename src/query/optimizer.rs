@@ -44,9 +44,27 @@ impl CostModel {
         stats: &PlanStatistics,
         vector_index_hints: &HashMap<(String, String), bool>,
     ) -> f64 {
+        self.estimate_cost_with_index_hints_and_graph(op, stats, vector_index_hints, None)
+    }
+    
+    /// Estimate cost of a plan operator with vector index hints and graph access
+    pub fn estimate_cost_with_index_hints_and_graph(
+        &self,
+        op: &PlanOperator,
+        stats: &PlanStatistics,
+        vector_index_hints: &HashMap<(String, String), bool>,
+        graph: Option<&HyperGraph>,
+    ) -> f64 {
         match op {
-            PlanOperator::Scan { table, columns, .. } => {
-                // Check if any columns have vector indexes
+            PlanOperator::BitsetJoin { left, right, .. } => {
+                // Bitset join cost: similar to regular join but with bitmap index benefits
+                let left_cost = self.estimate_cost_with_index_hints_and_graph(left, stats, vector_index_hints, graph);
+                let right_cost = self.estimate_cost_with_index_hints_and_graph(right, stats, vector_index_hints, graph);
+                // Bitset join is cheaper: O(n) instead of O(n*m) for hash join
+                left_cost + right_cost + stats.cardinality as f64 * self.join_cost_per_row * 0.1
+            }
+            PlanOperator::Scan { table, columns, node_id, .. } => {
+                // OPTIMIZATION: Check for vector indexes
                 let mut has_vector_index = false;
                 for col in columns {
                     if vector_index_hints.get(&(table.clone(), col.clone())).copied().unwrap_or(false) {
@@ -55,17 +73,36 @@ impl CostModel {
                     }
                 }
                 
-                if has_vector_index {
+                // OPTIMIZATION: Use size_bytes for I/O cost estimation
+                let io_cost = if let Some(g) = graph {
+                    if let Some(node) = g.get_node(*node_id) {
+                        // I/O cost based on data size: larger data = more I/O
+                        let size_mb = (node.stats.size_bytes as f64) / (1024.0 * 1024.0);
+                        size_mb * 0.1  // 0.1 cost per MB (configurable)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+                
+                let base_scan_cost = if has_vector_index {
                     // Vector index scan is much cheaper: O(log n) instead of O(n)
                     // Use logarithmic cost model for vector index scans
                     let log_n = (stats.cardinality as f64).ln().max(1.0);
                     log_n * self.scan_cost_per_row * 0.1  // 10x cheaper than linear scan
                 } else {
                     stats.cardinality as f64 * self.scan_cost_per_row
-                }
+                };
+                
+                base_scan_cost + io_cost  // Add I/O cost to scan cost
             }
             PlanOperator::CTEScan { .. } => {
                 // CTE scan is similar to regular scan but from memory cache
+                stats.cardinality as f64 * self.scan_cost_per_row * 0.5  // Faster than disk scan
+            }
+            PlanOperator::DerivedTableScan { .. } => {
+                // Derived table scan is similar to CTE scan - reads from memory cache
                 stats.cardinality as f64 * self.scan_cost_per_row * 0.5  // Faster than disk scan
             }
             PlanOperator::Join { left, right, .. } => {
@@ -158,6 +195,26 @@ impl CostModel {
                 // Window functions require sorting/partitioning, more expensive than filter
                 input_cost + stats.cardinality as f64 * (stats.cardinality as f64).log2() * 0.5
             }
+            PlanOperator::Fused { input, operations } => {
+                // Fused operators are typically faster (1.5-4x speedup)
+                let input_cost = self.estimate_cost(input, stats);
+                // Apply operations cost (fused operations are cheaper than separate)
+                let mut fused_cost = input_cost;
+                for op in operations {
+                    match op {
+                        crate::query::plan::FusedOperation::Filter { .. } => {
+                            fused_cost += stats.cardinality as f64 * 0.00005; // Very fast when fused
+                        }
+                        crate::query::plan::FusedOperation::Project { .. } => {
+                            fused_cost += stats.cardinality as f64 * 0.0001; // Fast when fused
+                        }
+                        crate::query::plan::FusedOperation::Aggregate { group_by, .. } => {
+                            fused_cost += group_by.len() as f64 * 0.001; // Faster when fused
+                        }
+                    }
+                }
+                fused_cost * 0.5  // 50% cost reduction from fusion
+            }
         }
     }
     
@@ -174,7 +231,12 @@ impl CostModel {
                 // For now, use same default as regular scan
                 1000
             }
-            PlanOperator::Join { left, right, .. } => {
+            PlanOperator::DerivedTableScan { .. } => {
+                // Derived table cardinality should be known from execution
+                // For now, use same default as regular scan
+                1000
+            }
+            PlanOperator::Join { left, right, .. } | PlanOperator::BitsetJoin { left, right, .. } => {
                 self.estimate_cardinality(left) + self.estimate_cardinality(right)
             }
             PlanOperator::Filter { input, predicates, .. } => {
@@ -214,6 +276,26 @@ impl CostModel {
                 };
                 
                 (base_cardinality as f64 * selectivity) as usize
+            }
+            PlanOperator::Fused { input, operations } => {
+                // Fused operators apply operations in sequence
+                let mut card = self.estimate_cardinality(input);
+                for op in operations {
+                    match op {
+                        crate::query::plan::FusedOperation::Filter { .. } => {
+                            // Filter reduces cardinality
+                            card = (card as f64 * 0.1) as usize; // Default 10% selectivity
+                        }
+                        crate::query::plan::FusedOperation::Project { .. } => {
+                            // Project doesn't change cardinality
+                        }
+                        crate::query::plan::FusedOperation::Aggregate { group_by, .. } => {
+                            // Aggregate reduces to number of groups
+                            card = group_by.len();
+                        }
+                    }
+                }
+                card
             }
             PlanOperator::Aggregate { input, group_by, .. } => {
                 let input_cardinality = self.estimate_cardinality(input);
@@ -255,6 +337,26 @@ impl CostModel {
             PlanOperator::Window { input, .. } => {
                 // Window functions don't change cardinality, just add columns
                 self.estimate_cardinality(input)
+            }
+            PlanOperator::Fused { input, operations } => {
+                // Fused operators apply operations in sequence
+                let mut card = self.estimate_cardinality(input);
+                for op in operations {
+                    match op {
+                        crate::query::plan::FusedOperation::Filter { .. } => {
+                            // Filter reduces cardinality
+                            card = (card as f64 * 0.1) as usize; // Default 10% selectivity
+                        }
+                        crate::query::plan::FusedOperation::Project { .. } => {
+                            // Project doesn't change cardinality
+                        }
+                        crate::query::plan::FusedOperation::Aggregate { group_by, .. } => {
+                            // Aggregate reduces to number of groups
+                            card = group_by.len();
+                        }
+                    }
+                }
+                card
             }
         }
     }
@@ -338,6 +440,10 @@ impl HypergraphOptimizer {
             PlanOperator::Distinct { input, .. } => {
                 Self::analyze_operator_for_vector_ops(input, hints, graph);
             }
+            PlanOperator::BitsetJoin { left, right, .. } => {
+                Self::analyze_operator_for_vector_ops(left, hints, graph);
+                Self::analyze_operator_for_vector_ops(right, hints, graph);
+            }
             PlanOperator::Having { input, .. } => {
                 Self::analyze_operator_for_vector_ops(input, hints, graph);
             }
@@ -346,6 +452,12 @@ impl HypergraphOptimizer {
             }
             PlanOperator::CTEScan { .. } => {
                 // CTEs don't have vector indexes (they're cached results)
+            }
+            PlanOperator::DerivedTableScan { .. } => {
+                // Derived tables don't have vector indexes (they're cached results)
+            }
+            PlanOperator::Fused { input, .. } => {
+                Self::analyze_operator_for_vector_ops(input, hints, graph);
             }
         }
     }
@@ -600,7 +712,7 @@ impl HypergraphOptimizer {
     pub fn estimate_cardinality(&self, op: &PlanOperator) -> usize {
         match op {
             PlanOperator::Scan { node_id, .. } => {
-                // Use actual statistics from hypergraph node
+                // OPTIMIZATION: Use actual statistics from hypergraph node (including size_bytes)
                 if let Some(node) = self.graph.get_node(*node_id) {
                     // Try to use node statistics first
                     let stats_row_count = node.stats.row_count;
@@ -617,6 +729,15 @@ impl HypergraphOptimizer {
                     // Use cardinality estimate from stats
                     if node.stats.cardinality > 0 {
                         return node.stats.cardinality;
+                    }
+                    
+                    // OPTIMIZATION: Use size_bytes to estimate rows if available
+                    // Estimate: ~8 bytes per row on average (for numeric data)
+                    if node.stats.size_bytes > 0 {
+                        let estimated_rows = node.stats.size_bytes / 8;
+                        if estimated_rows > 0 {
+                            return estimated_rows;
+                        }
                     }
                 }
                 

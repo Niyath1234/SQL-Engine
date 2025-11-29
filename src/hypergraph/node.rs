@@ -30,7 +30,7 @@ pub struct HyperNode {
     pub metadata: HashMap<String, String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub u64);
 
 impl std::fmt::Display for NodeId {

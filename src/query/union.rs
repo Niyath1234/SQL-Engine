@@ -46,6 +46,9 @@ impl SetOperator {
 }
 
 impl BatchIterator for SetOperator {
+    fn prepare(&mut self) -> Result<(), anyhow::Error> {
+        Ok(()) // SetOperator doesn't need prepare() yet
+    }
     fn next(&mut self) -> Result<Option<ExecutionBatch>> {
         match self.operation {
             SetOperation::Union => self.execute_union(),

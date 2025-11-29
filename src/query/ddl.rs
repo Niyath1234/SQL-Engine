@@ -112,13 +112,13 @@ fn sql_type_to_arrow_type(sql_type: &sqlparser::ast::DataType) -> Result<ArrowDa
             Ok(ArrowDataType::Int64)
         },
         sqlparser::ast::DataType::Custom(name, _) => {
-            // Handle custom types like UUID
+            // Handle custom types like UUID, STRING
             let type_name = name.0.iter()
                 .map(|ident| ident.value.clone())
                 .collect::<Vec<_>>()
                 .join(".");
-            if type_name.eq_ignore_ascii_case("uuid") {
-                Ok(ArrowDataType::Utf8) // Store UUIDs as strings
+            if type_name.eq_ignore_ascii_case("uuid") || type_name.eq_ignore_ascii_case("string") {
+                Ok(ArrowDataType::Utf8) // Store UUIDs and STRING as strings
             } else {
                 anyhow::bail!("Unsupported custom data type: {}", type_name)
             }

@@ -125,6 +125,8 @@ fn create_large_dataset(engine: &mut HypergraphSQLEngine, size: usize) -> Result
             cardinality: size,
             compression: hypergraph_sql_engine::storage::fragment::CompressionType::None,
             memory_size: size * 8,
+            table_name: None,
+            column_name: None,
         },
     );
     
@@ -137,6 +139,8 @@ fn create_large_dataset(engine: &mut HypergraphSQLEngine, size: usize) -> Result
             cardinality: size,
             compression: hypergraph_sql_engine::storage::fragment::CompressionType::None,
             memory_size: size * 20,
+            table_name: None,
+            column_name: None,
         },
     );
     
@@ -149,6 +153,8 @@ fn create_large_dataset(engine: &mut HypergraphSQLEngine, size: usize) -> Result
             cardinality: size,
             compression: hypergraph_sql_engine::storage::fragment::CompressionType::None,
             memory_size: size * 8,
+            table_name: None,
+            column_name: None,
         },
     );
     
@@ -161,6 +167,8 @@ fn create_large_dataset(engine: &mut HypergraphSQLEngine, size: usize) -> Result
             cardinality: 5,
             compression: hypergraph_sql_engine::storage::fragment::CompressionType::None,
             memory_size: size * 15,
+            table_name: None,
+            column_name: None,
         },
     );
     
@@ -173,6 +181,8 @@ fn create_large_dataset(engine: &mut HypergraphSQLEngine, size: usize) -> Result
             cardinality: 5,
             compression: hypergraph_sql_engine::storage::fragment::CompressionType::None,
             memory_size: size * 8,
+            table_name: None,
+            column_name: None,
         },
     );
     
@@ -279,6 +289,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cardinality: 5,
                     compression: hypergraph_sql_engine::storage::fragment::CompressionType::None,
                     memory_size: 40,
+                    table_name: None,
+                    column_name: None,
                 },
             );
             
@@ -291,6 +303,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cardinality: 5,
                     compression: hypergraph_sql_engine::storage::fragment::CompressionType::None,
                     memory_size: 100,
+                    table_name: None,
+                    column_name: None,
                 },
             );
             

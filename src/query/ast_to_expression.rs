@@ -164,6 +164,10 @@ pub fn sql_expr_to_expression(expr: &Expr) -> Result<Expression> {
                 Ok(exists_expr)
             }
         }
+        Expr::Nested(inner) => {
+            // Nested expressions (parentheses) - just unwrap and recurse
+            sql_expr_to_expression(inner)
+        }
         _ => anyhow::bail!("Unsupported expression type: {:?}", expr)
     }
 }
