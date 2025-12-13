@@ -169,6 +169,7 @@ impl CacheOptimizedFragmentBuilder {
                 memory_size,
                 table_name: None,
                 column_name: None,
+                metadata: std::collections::HashMap::new(),
             };
             
             // Create fragment with cache-aligned layout

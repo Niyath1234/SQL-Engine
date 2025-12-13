@@ -28,6 +28,38 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::collections::HashMap;
 use anyhow::Result;
+use tracing::{error, warn, debug};
+
+// Safe helper functions for engine.rs
+fn safe_get_column(batch: &crate::execution::batch::ExecutionBatch, col_idx: usize) -> Result<Arc<dyn arrow::array::Array>> {
+    batch.batch.columns.get(col_idx)
+        .ok_or_else(|| anyhow::anyhow!(
+            "Column index {} out of bounds (batch has {} columns)",
+            col_idx,
+            batch.batch.columns.len()
+        ))
+        .cloned()
+}
+
+fn safe_downcast_string(array: &Arc<dyn arrow::array::Array>) -> Result<&StringArray> {
+    array.as_any().downcast_ref::<StringArray>()
+        .ok_or_else(|| anyhow::anyhow!("Failed to downcast to StringArray (got {:?})", array.data_type()))
+}
+
+fn safe_downcast_int64(array: &Arc<dyn arrow::array::Array>) -> Result<&Int64Array> {
+    array.as_any().downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow::anyhow!("Failed to downcast to Int64Array (got {:?})", array.data_type()))
+}
+
+fn safe_downcast_float64(array: &Arc<dyn arrow::array::Array>) -> Result<&Float64Array> {
+    array.as_any().downcast_ref::<Float64Array>()
+        .ok_or_else(|| anyhow::anyhow!("Failed to downcast to Float64Array (got {:?})", array.data_type()))
+}
+
+fn safe_downcast_boolean(array: &Arc<dyn arrow::array::Array>) -> Result<&BooleanArray> {
+    array.as_any().downcast_ref::<BooleanArray>()
+        .ok_or_else(|| anyhow::anyhow!("Failed to downcast to BooleanArray (got {:?})", array.data_type()))
+}
 
 /// Main SQL engine interface
 pub struct HypergraphSQLEngine {
@@ -68,6 +100,10 @@ pub struct HypergraphSQLEngine {
     auto_save_counter: std::sync::atomic::AtomicU64,
     /// Persistent compiled operator cache (WASM modules, micro-kernels)
     operator_cache: Arc<std::sync::Mutex<crate::cache::operator_cache::OperatorCache>>,
+    /// WorldState - The authoritative "spine" of DA_Cursor
+    world_state: crate::worldstate::WorldStateRef,
+    /// WorldState persistence manager
+    world_state_persistence: Option<crate::worldstate::persistence::WorldStatePersistence>,
 }
 
 impl HypergraphSQLEngine {
@@ -191,6 +227,26 @@ impl HypergraphSQLEngine {
         // Rebuild table_index to ensure any existing nodes are properly indexed
         graph.rebuild_table_index();
         
+        // PHASE 1: Initialize WorldState (the "spine" of DA_Cursor)
+        let persistence = crate::worldstate::persistence::WorldStatePersistence::default_path();
+        let world_state_persistence = Some(crate::worldstate::persistence::WorldStatePersistence::new(&persistence));
+        
+        // Load WorldState from disk if it exists, otherwise create new
+        let world_state = if let Some(ref pers) = world_state_persistence {
+            match pers.load() {
+                Ok(ws) => {
+                    eprintln!("✅ Loaded WorldState from {}", pers.path().display());
+                    std::sync::Arc::new(std::sync::RwLock::new(ws))
+                }
+                Err(e) => {
+                    eprintln!("⚠️  Failed to load WorldState: {}. Creating new WorldState.", e);
+                    crate::worldstate::new_world_state_ref()
+                }
+            }
+        } else {
+            crate::worldstate::new_world_state_ref()
+        };
+        
         Self {
             graph,
             planner,
@@ -214,6 +270,8 @@ impl HypergraphSQLEngine {
             tiered_storage,
             auto_save_counter: std::sync::atomic::AtomicU64::new(0),
             operator_cache,
+            world_state,
+            world_state_persistence,
         }
     }
     
@@ -337,8 +395,12 @@ impl HypergraphSQLEngine {
             }
             sqlparser::ast::Statement::CreateTable { .. } => {
                 // CREATE TABLE statement
+                eprintln!("DEBUG engine: Parsing CREATE TABLE statement");
                 let create_stmt = extract_create_table(&ast)?;
-                self.execute_create_table(create_stmt)
+                eprintln!("DEBUG engine: Executing CREATE TABLE for '{}'", create_stmt.table_name);
+                let result = self.execute_create_table(create_stmt)?;
+                eprintln!("DEBUG engine: CREATE TABLE executed successfully");
+                Ok(result)
             }
             sqlparser::ast::Statement::Drop { .. } => {
                 // DROP TABLE statement
@@ -598,6 +660,23 @@ impl HypergraphSQLEngine {
             }
         }
         
+        // PHASE 3: Validate plan against join rules
+        {
+            let world_state = self.world_state();
+            let validator = crate::query::plan_validator::PlanValidator::new();
+            if let Err(e) = validator.validate_plan(
+                &plan,
+                &world_state.rule_registry,
+                &world_state.schema_registry,
+                &world_state.key_registry,
+            ) {
+                return Err(anyhow::anyhow!(
+                    "Query rejected: Join validation failed.\n\n{}",
+                    e
+                ));
+            }
+        }
+        
         // 5. Cache plan
         self.plan_cache.insert(signature.clone(), plan.clone());
         
@@ -713,7 +792,9 @@ impl HypergraphSQLEngine {
             use crate::query::continuous_learning::ExecutionFeedback;
             let features = extract_features_from_plan(&plan);
             let feedback = ExecutionFeedback {
-                query_id: format!("query_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()),
+                query_id: format!("query_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| anyhow::anyhow!("Failed to get system time: {}", e))?
+                    .as_secs()),
                 estimated_cost: plan.estimated_cost,
                 actual_execution_time_ms: result.execution_time_ms,
                 actual_memory_bytes: 0, // TODO: get from execution engine
@@ -1230,17 +1311,17 @@ impl HypergraphSQLEngine {
             // We expect MV schema to be:
             //   [Year, Industry_aggregation_NZSIOC, COUNT(*), SUM(Value), AVG(Value)]
             // Use positional indices to avoid relying on exact field names.
-            let year_col = batch.batch.column(0).unwrap();
-            let industry_col = batch.batch.column(1).unwrap();
-            let count_col = batch.batch.column(2).unwrap();
-            let sum_col = batch.batch.column(3).unwrap();
-            let avg_col = batch.batch.column(4).unwrap();
+            let year_col = safe_get_column(batch, 0)?;
+            let industry_col = safe_get_column(batch, 1)?;
+            let count_col = safe_get_column(batch, 2)?;
+            let sum_col = safe_get_column(batch, 3)?;
+            let avg_col = safe_get_column(batch, 4)?;
 
-            let year_arr = year_col.as_any().downcast_ref::<StringArray>().unwrap();
-            let industry_arr = industry_col.as_any().downcast_ref::<StringArray>().unwrap();
-            let count_arr = count_col.as_any().downcast_ref::<Int64Array>().unwrap();
-            let sum_arr = sum_col.as_any().downcast_ref::<Float64Array>().unwrap();
-            let avg_arr = avg_col.as_any().downcast_ref::<Float64Array>().unwrap();
+            let year_arr = safe_downcast_string(&year_col)?;
+            let industry_arr = safe_downcast_string(&industry_col)?;
+            let count_arr = safe_downcast_int64(&count_col)?;
+            let sum_arr = safe_downcast_float64(&sum_col)?;
+            let avg_arr = safe_downcast_float64(&avg_col)?;
 
             for i in 0..batch.row_count {
                 if !batch.selection[i] {
@@ -1581,7 +1662,9 @@ impl HypergraphSQLEngine {
         Ok(table_node_id)
     }
     
-    /// Add a join relationship
+    /// Add a join relationship (legacy - use add_join_rule instead)
+    /// 
+    /// PHASE 3: This method now validates against join rules
     pub fn add_join(
         &mut self,
         left_table: &str,
@@ -1589,6 +1672,39 @@ impl HypergraphSQLEngine {
         right_table: &str,
         right_column: &str,
     ) -> Result<EdgeId> {
+        // PHASE 3: Validate join against rules first
+        let validator = crate::ingestion::JoinValidator::new();
+        let world_state = self.world_state();
+        let validation = validator.validate_join(
+            &world_state.rule_registry,
+            &world_state.schema_registry,
+            &world_state.key_registry,
+            left_table,
+            &[left_column.to_string()],
+            right_table,
+            &[right_column.to_string()],
+            "inner",
+        );
+        drop(world_state);
+        
+        match validation {
+            crate::ingestion::JoinValidationResult::Valid { .. } => {
+                // Join is approved, proceed
+            }
+            crate::ingestion::JoinValidationResult::Invalid { reason, .. } => {
+                return Err(anyhow::anyhow!(
+                    "Join not allowed: {}.{} JOIN {}.{} - {}",
+                    left_table, left_column, right_table, right_column, reason
+                ));
+            }
+            crate::ingestion::JoinValidationResult::CartesianProduct { reason } => {
+                return Err(anyhow::anyhow!(
+                    "Join would create Cartesian product: {}",
+                    reason
+                ));
+            }
+        }
+        
         // Find or create nodes
         let left_node = self.graph.get_node_by_table_column(left_table, left_column)
             .ok_or_else(|| anyhow::anyhow!("Left node not found: {}.{}", left_table, left_column))?;
@@ -1612,6 +1728,213 @@ impl HypergraphSQLEngine {
         self.graph.add_edge(edge);
         
         Ok(edge_id)
+    }
+    
+    // ========== PHASE 3: Join Rule Management ==========
+    
+    /// Create a join rule (proposed state)
+    pub fn create_join_rule(
+        &mut self,
+        left_table: String,
+        left_key: Vec<String>,
+        right_table: String,
+        right_key: Vec<String>,
+        join_type: String,
+        cardinality: String,
+    ) -> Result<String> {
+        let rule_id = format!("rule_{}_{}", left_table, right_table);
+        
+        let mut rule = crate::worldstate::rules::JoinRule::new(
+            rule_id.clone(),
+            left_table,
+            left_key,
+            right_table,
+            right_key,
+            join_type,
+            cardinality,
+        );
+        rule.state = crate::worldstate::rules::RuleState::Proposed;
+        
+        {
+            let mut world_state = self.world_state_mut();
+            world_state.rule_registry.register_rule(rule);
+            world_state.bump_version();
+        }
+        
+        Ok(rule_id)
+    }
+    
+    /// Register a filter rule (business rule for default filters)
+    pub fn register_filter_rule(
+        &mut self,
+        rule_id: String,
+        table_name: String,
+        column: String,
+        operator: String,
+        value: serde_json::Value,
+        mandatory: bool,
+        justification: Option<String>,
+    ) -> Result<()> {
+        use crate::worldstate::rules::FilterRule;
+        
+        let mut rule = FilterRule::new(
+            rule_id.clone(),
+            table_name.clone(),
+            column.clone(),
+            operator.clone(),
+            value.clone(),
+            mandatory,
+        );
+        rule.justification = justification;
+        rule.approve(); // Auto-approve for now
+        
+        // Get node_id first (before borrowing world_state)
+        let node_id_opt = self.graph.get_table_node(&table_name).map(|n| n.id);
+        
+        {
+            let mut world_state = self.world_state_mut();
+            world_state.filter_rule_registry.register_rule(rule.clone());
+            world_state.bump_version();
+        }
+        
+        // Store in node metadata for quick lookup (after world_state borrow is released)
+        if let Some(node_id) = node_id_opt {
+            // Get existing filter rules from metadata
+            let existing_rules: Vec<FilterRule> = if let Some(table_node) = self.graph.get_table_node(&table_name) {
+                if let Some(rules_json) = table_node.metadata.get("filter_rules") {
+                    serde_json::from_str(rules_json).unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            
+            // Add new rule
+            let mut updated_rules = existing_rules;
+            updated_rules.push(rule);
+            
+            // Store back in metadata
+            let rules_json = serde_json::to_string(&updated_rules)?;
+            let mut metadata_updates = std::collections::HashMap::new();
+            metadata_updates.insert("filter_rules".to_string(), rules_json);
+            self.graph.update_node_metadata(node_id, metadata_updates);
+        }
+        
+        Ok(())
+    }
+    
+    /// Approve a join rule (moves from Proposed to Approved)
+    pub fn approve_join_rule(&mut self, rule_id: &str) -> Result<()> {
+        // First, update the rule state
+        {
+            let mut world_state = self.world_state_mut();
+            if let Some(rule) = world_state.rule_registry.get_rule(rule_id) {
+                let mut updated_rule = rule.clone();
+                updated_rule.approve();
+                world_state.rule_registry.register_rule(updated_rule);
+                world_state.bump_version();
+            } else {
+                return Err(anyhow::anyhow!("Rule {} not found", rule_id));
+            }
+        }
+        
+        // Then sync to hypergraph (separate borrow)
+        // Get rule details first
+        let (left_table, left_key, right_table, right_key) = {
+            let world_state = self.world_state();
+            let rule = world_state.rule_registry.get_rule(rule_id)
+                .ok_or_else(|| anyhow::anyhow!("Rule {} not found after approval", rule_id))?;
+            if !rule.is_approved() {
+                return Ok(()); // Not approved, skip
+            }
+            (rule.left_table.clone(), rule.left_key[0].clone(), 
+             rule.right_table.clone(), rule.right_key[0].clone())
+        };
+        
+        // Now sync to hypergraph (no borrow conflict)
+        if let Err(e) = self.add_join(&left_table, &left_key, &right_table, &right_key) {
+            eprintln!("Note: Could not create hypergraph edge for rule {}: {}", rule_id, e);
+        }
+        
+        Ok(())
+    }
+    
+    
+    /// Sync all approved rules to hypergraph edges
+    pub fn sync_all_approved_rules_to_hypergraph(&mut self) -> Result<()> {
+        let rule_ids: Vec<String> = {
+            let world_state = self.world_state();
+            world_state.rule_registry.list_approved_rules()
+                .iter()
+                .map(|r| r.id.clone())
+                .collect()
+        };
+        
+        for rule_id in rule_ids {
+            // Get rule details
+            let (left_table, left_key, right_table, right_key) = {
+                let world_state = self.world_state();
+                let rule = world_state.rule_registry.get_rule(&rule_id)
+                    .ok_or_else(|| anyhow::anyhow!("Rule {} not found", rule_id))?;
+                if rule.left_key.len() != 1 || rule.right_key.len() != 1 {
+                    continue; // Skip multi-column joins for now
+                }
+                (rule.left_table.clone(), rule.left_key[0].clone(),
+                 rule.right_table.clone(), rule.right_key[0].clone())
+            };
+            
+            // Sync to hypergraph
+            if let Err(e) = self.add_join(&left_table, &left_key, &right_table, &right_key) {
+                eprintln!("Note: Could not create hypergraph edge for rule {}: {}", rule_id, e);
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Infer join rules from existing schemas
+    pub fn infer_join_rules(&mut self) -> Result<Vec<String>> {
+        let world_state = self.world_state();
+        let inference = crate::ingestion::JoinInference::new();
+        let proposals = inference.infer_joins(
+            &world_state.schema_registry,
+            &world_state.key_registry,
+        );
+        drop(world_state);
+        
+        let mut rule_ids = Vec::new();
+        for proposal in proposals {
+            let rule_id = self.create_join_rule(
+                proposal.rule.left_table,
+                proposal.rule.left_key,
+                proposal.rule.right_table,
+                proposal.rule.right_key,
+                proposal.rule.join_type,
+                proposal.rule.cardinality,
+            )?;
+            rule_ids.push(rule_id);
+        }
+        
+        Ok(rule_ids)
+    }
+    
+    /// Get all join rules (including proposed)
+    pub fn list_join_rules(&self) -> Vec<crate::worldstate::rules::JoinRule> {
+        let world_state = self.world_state();
+        world_state.rule_registry.list_all_rules()
+            .iter()
+            .map(|r| (*r).clone())
+            .collect()
+    }
+    
+    /// Get only approved join rules
+    pub fn list_approved_join_rules(&self) -> Vec<crate::worldstate::rules::JoinRule> {
+        let world_state = self.world_state();
+        world_state.rule_registry.list_approved_rules()
+            .iter()
+            .map(|r| (*r).clone())
+            .collect()
     }
     
     /// Find path for query tables
@@ -1647,6 +1970,248 @@ impl HypergraphSQLEngine {
             plan_cache_size: self.plan_cache.len(),
             result_cache_size: self.result_cache.len(),
         }
+    }
+    
+    // ========== PHASE 1: WorldState API ==========
+    
+    /// Get the WorldState (read-only access)
+    pub fn world_state(&self) -> std::sync::RwLockReadGuard<crate::worldstate::WorldState> {
+        self.world_state.read().unwrap()
+    }
+    
+    /// Get mutable WorldState (for updates)
+    pub fn world_state_mut(&mut self) -> std::sync::RwLockWriteGuard<crate::worldstate::WorldState> {
+        self.world_state.write().unwrap()
+    }
+    
+    /// Get global world hash
+    pub fn world_hash_global(&self) -> u64 {
+        self.world_state.read().unwrap().world_hash_global()
+    }
+    
+    /// Get relevant world hash for specific tables/edges
+    pub fn world_hash_relevant(&self, tables: &[String], edges: &[String]) -> u64 {
+        self.world_state.read().unwrap().world_hash_relevant(tables, edges)
+    }
+    
+    /// Export metadata pack (RBAC-filtered)
+    pub fn export_metadata_pack(&self, user_id: Option<&str>) -> crate::worldstate::MetadataPack {
+        self.world_state.read().unwrap().build_metadata_pack(user_id)
+    }
+
+    /// Export metadata pack where table schemas come from the hypergraph execution truth.
+    ///
+    /// Join rules / policies / stats still come from WorldState, but `tables[].columns[]` are
+    /// replaced with what the engine can actually execute against.
+    pub fn export_metadata_pack_execution_truth(&self, user_id: Option<&str>) -> crate::worldstate::MetadataPack {
+        let mut pack = self.world_state.read().unwrap().build_metadata_pack(user_id);
+
+        // Build a map of WorldState ColumnInfo so we can preserve nullable/tags/description when possible.
+        let world_state = self.world_state.read().unwrap();
+        let mut ws_cols: std::collections::HashMap<(String, String), crate::worldstate::ColumnInfo> =
+            std::collections::HashMap::new();
+        for t in world_state.schema_registry.list_tables() {
+            if let Some(schema) = world_state.schema_registry.get_table(&t) {
+                for c in &schema.columns {
+                    ws_cols.insert((t.clone(), c.name.clone()), c.clone());
+                }
+            }
+        }
+        drop(world_state);
+
+        // Rebuild pack tables from hypergraph schemas, but keep RBAC filtering as defined by the original pack.tables list.
+        let allowed_tables: Vec<String> = pack.tables.iter().map(|t| t.name.clone()).collect();
+        let mut new_tables = Vec::new();
+        for t in allowed_tables {
+            // describe_table reads from hypergraph fragments (execution truth)
+            if let Ok(schema) = self.describe_table(&t) {
+                let mut cols = Vec::new();
+                for (col_name, col_type) in schema {
+                    let mut ci = ws_cols
+                        .get(&(t.clone(), col_name.clone()))
+                        .cloned()
+                        .unwrap_or(crate::worldstate::ColumnInfo {
+                            name: col_name.clone(),
+                            data_type: col_type.clone(),
+                            nullable: true,
+                            semantic_tags: Vec::new(),
+                            description: None,
+                        });
+                    // Always trust execution-truth type string for planning.
+                    ci.data_type = col_type;
+                    ci.name = col_name;
+                    cols.push(ci);
+                }
+                new_tables.push(crate::worldstate::metadata_pack::TableInfo {
+                    name: t.clone(),
+                    columns: cols,
+                    version: 1,
+                });
+            }
+        }
+        pack.tables = new_tables;
+        
+        // Rebuild hypergraph_edges from join rules (they're already in pack.join_rules)
+        pack.hypergraph_edges = pack.join_rules.iter()
+            .filter_map(|rule| {
+                rule.left_key.first().map(|left_key| crate::worldstate::metadata_pack::HypergraphEdge {
+                    from_table: rule.left_table.clone(),
+                    to_table: rule.right_table.clone(),
+                    via_column: left_key.clone(),
+                })
+            })
+            .collect();
+        
+        pack
+    }
+
+    /// Deterministic hash of hypergraph schema (tables + columns + type strings) for a set of tables.
+    pub fn hypergraph_schema_hash(&self, tables: &[String]) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        let mut ts = tables.to_vec();
+        ts.sort();
+        for t in ts {
+            t.hash(&mut hasher);
+            if let Ok(cols) = self.describe_table(&t) {
+                // Sort for deterministic hashing (column order can differ from WorldState order)
+                let mut cols_sorted = cols;
+                cols_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                for (c, ty) in cols_sorted {
+                    c.hash(&mut hasher);
+                    ty.hash(&mut hasher);
+                }
+            }
+        }
+        hasher.finish()
+    }
+
+    /// Deterministic hash of WorldState schema for a set of tables.
+    pub fn worldstate_schema_hash(&self, tables: &[String]) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let world_state = self.world_state.read().unwrap();
+        let mut hasher = DefaultHasher::new();
+        let mut ts = tables.to_vec();
+        ts.sort();
+        for t in ts {
+            if let Some(schema) = world_state.schema_registry.get_table(&t) {
+                schema.hash(&mut hasher);
+            } else {
+                // Missing table should impact hash
+                t.hash(&mut hasher);
+                "MISSING".hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
+    /// Deterministic hash of WorldState schema using the same semantics as hypergraph execution schema:
+    /// (table name + sorted column name + data_type) only.
+    ///
+    /// This intentionally ignores version/timestamps/nullable/tags so it can be compared to `hypergraph_schema_hash`.
+    pub fn worldstate_execution_schema_hash(&self, tables: &[String]) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let world_state = self.world_state.read().unwrap();
+        let mut hasher = DefaultHasher::new();
+        let mut ts = tables.to_vec();
+        ts.sort();
+        for t in ts {
+            t.hash(&mut hasher);
+            if let Some(schema) = world_state.schema_registry.get_table(&t) {
+                let mut cols = schema.columns.clone();
+                cols.sort_by(|a, b| a.name.cmp(&b.name));
+                for c in cols {
+                    c.name.hash(&mut hasher);
+                    c.data_type.hash(&mut hasher);
+                }
+            }
+        }
+        hasher.finish()
+    }
+
+    /// Repair: rebuild WorldState SchemaRegistry from hypergraph execution schema.
+    ///
+    /// This is intentionally conservative: it only rebuilds the schema registry. Keys/rules/stats are not inferred here.
+    pub fn sync_worldstate_schema_from_hypergraph(&mut self) -> Result<()> {
+        use anyhow::Context;
+        use crate::worldstate::{ColumnInfo, TableSchema};
+
+        // Find all tables currently present in the hypergraph
+        let mut tables: Vec<String> = self.graph
+            .iter_nodes()
+            .filter_map(|(_, node)| {
+                if matches!(node.node_type, crate::hypergraph::node::NodeType::Table) {
+                    node.table_name.clone()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        tables.sort();
+        tables.dedup();
+
+        // IMPORTANT: collect schemas first without holding a mutable WorldState lock to avoid borrow conflicts.
+        let mut collected: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        for t in &tables {
+            let cols = self
+                .describe_table(t)
+                .with_context(|| format!("Failed to describe hypergraph table '{}'", t))?;
+            collected.push((t.clone(), cols));
+        }
+
+        let mut ws = self.world_state_mut();
+        for (t, cols) in collected {
+            let mut schema = TableSchema::new(t.clone());
+            schema.columns = cols
+                .into_iter()
+                .map(|(name, data_type)| ColumnInfo {
+                    name,
+                    data_type,
+                    nullable: true,
+                    semantic_tags: Vec::new(),
+                    description: None,
+                })
+                .collect();
+            ws.schema_registry.register_table(schema);
+        }
+        ws.bump_version();
+        Ok(())
+    }
+    
+    /// Save WorldState to disk
+    pub fn save_world_state(&self) -> Result<()> {
+        if let Some(ref persistence) = self.world_state_persistence {
+            let world_state = self.world_state.read().unwrap();
+            persistence.save(&*world_state)?;
+            Ok(())
+        } else {
+            // In web_admin/dev mode, persistence may be intentionally disabled.
+            // Treat as best-effort no-op so ingestion/queries remain usable out-of-the-box.
+            Ok(())
+        }
+    }
+    
+    /// Bump WorldState version (call after any mutation)
+    pub fn bump_world_state_version(&mut self) {
+        self.world_state_mut().bump_version();
+    }
+    
+    // ========== PHASE 2: Ingestion API ==========
+    
+    /// Ingest data from a connector
+    pub fn ingest(
+        &mut self,
+        connector: Box<dyn crate::ingestion::IngestionConnector>,
+        table_name: Option<String>,
+    ) -> Result<crate::ingestion::IngestionResult> {
+        let orchestrator = crate::ingestion::IngestionOrchestrator::new();
+        orchestrator.ingest(self, connector, table_name)
     }
     
     /// Get top-N hot fragments from the underlying hypergraph
@@ -1891,10 +2456,32 @@ impl HypergraphSQLEngine {
         // Get current transaction
         let txn_id = self.current_transaction;
         
-        // Find table node
+        // Find table node (case-insensitive search)
+        let table_name_lower = insert.table_name.to_lowercase();
         let table_node = self.graph.iter_nodes()
-            .find(|(_, node)| node.table_name.as_ref() == Some(&insert.table_name) && matches!(node.node_type, crate::hypergraph::node::NodeType::Table))
-            .ok_or_else(|| anyhow::anyhow!("Table '{}' not found", insert.table_name))?;
+            .find(|(_, node)| {
+                node.table_name.as_ref()
+                    .map(|name| name.to_lowercase() == table_name_lower)
+                    .unwrap_or(false)
+                    && matches!(node.node_type, crate::hypergraph::node::NodeType::Table)
+            })
+            .ok_or_else(|| {
+                // Debug: List all available tables
+                let available_tables: Vec<String> = self.graph.iter_nodes()
+                    .filter_map(|(_, node)| {
+                        if matches!(node.node_type, crate::hypergraph::node::NodeType::Table) {
+                            node.table_name.clone()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                anyhow::anyhow!(
+                    "Table '{}' not found in hypergraph. Available tables: {:?}",
+                    insert.table_name,
+                    available_tables
+                )
+            })?;
         
         let (table_node_id, table_node) = table_node;
         
@@ -1962,6 +2549,7 @@ impl HypergraphSQLEngine {
                     memory_size: 0, // Will be calculated
                     table_name: None,
                     column_name: None,
+                    metadata: std::collections::HashMap::new(),
                 },
                 bloom_filter: None,
                 bitmap_index: None,
@@ -2322,6 +2910,7 @@ impl HypergraphSQLEngine {
                     memory_size: 0,
                     table_name: None,
                     column_name: None,
+                    metadata: std::collections::HashMap::new(),
                 },
                 bloom_filter: None,
                 bitmap_index: None,
@@ -2361,6 +2950,38 @@ impl HypergraphSQLEngine {
             metadata_updates.insert("constraints".to_string(), serde_json::to_string(&constraints)?);
         }
         self.graph.update_node_metadata(table_node_id, metadata_updates);
+        
+        // PHASE 1: Auto-register table in WorldState schema registry
+        {
+            use crate::worldstate::schema::{TableSchema, ColumnInfo};
+            let mut world_state = self.world_state_mut();
+            let mut schema = TableSchema::new(create.table_name.clone());
+            
+            for col_def in &create.columns {
+                let semantic_tags = if col_def.name.to_lowercase().ends_with("_id") {
+                    vec!["key/foreign".to_string()]
+                } else if col_def.name.to_lowercase() == "id" {
+                    vec!["key/primary".to_string()]
+                } else if col_def.name.to_lowercase().contains("amount") || col_def.name.to_lowercase().contains("price") {
+                    vec!["fact/amount".to_string()]
+                } else if col_def.name.to_lowercase().contains("date") || col_def.name.to_lowercase().contains("created_at") || col_def.name.to_lowercase().contains("updated_at") {
+                    vec!["time/event".to_string()]
+                } else {
+                    vec![]
+                };
+                
+                schema.add_column(ColumnInfo {
+                    name: col_def.name.clone(),
+                    data_type: format!("{:?}", col_def.data_type),
+                    nullable: col_def.nullable,
+                    semantic_tags,
+                    description: None,
+                });
+            }
+            
+            world_state.schema_registry.register_table(schema);
+            world_state.bump_version();
+        }
         
         let elapsed = start.elapsed();
         Ok(ExecutionQueryResult {
@@ -2565,9 +3186,11 @@ impl HypergraphSQLEngine {
         }
         
         // Add to bundler
+        // Note: SystemTime::duration_since can only fail if time goes backwards, which is extremely rare
+        // In production, we'd want to handle this more gracefully, but for now we use expect with a clear message
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("System time went backwards - this should never happen in normal operation")
             .as_millis() as u64;
         
         let pending = PendingQuery {
@@ -2658,6 +3281,7 @@ fn merge_fragments(frag1: &ColumnFragment, frag2: &ColumnFragment) -> Result<Col
             memory_size: frag1.metadata.memory_size + frag2.metadata.memory_size,
             table_name: frag1.metadata.table_name.clone(),
             column_name: frag1.metadata.column_name.clone(),
+            metadata: frag1.metadata.metadata.clone(),
         },
         bloom_filter: None,
         bitmap_index: None,
@@ -3078,7 +3702,7 @@ impl HypergraphSQLEngine {
         for i in 0..row_count {
             let value = match array.data_type() {
                 DataType::Int64 => {
-                    let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+                    let arr = safe_downcast_int64(&array)?;
                     if arr.is_null(i) {
                         crate::storage::fragment::Value::Null
                     } else {
@@ -3086,7 +3710,7 @@ impl HypergraphSQLEngine {
                     }
                 }
                 DataType::Float64 => {
-                    let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
+                    let arr = safe_downcast_float64(&array)?;
                     if arr.is_null(i) {
                         crate::storage::fragment::Value::Null
                     } else {
@@ -3094,7 +3718,7 @@ impl HypergraphSQLEngine {
                     }
                 }
                 DataType::Utf8 => {
-                    let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
+                    let arr = safe_downcast_string(&array)?;
                     if arr.is_null(i) {
                         crate::storage::fragment::Value::Null
                     } else {
@@ -3102,7 +3726,7 @@ impl HypergraphSQLEngine {
                     }
                 }
                 DataType::Boolean => {
-                    let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                    let arr = safe_downcast_boolean(&array)?;
                     if arr.is_null(i) {
                         crate::storage::fragment::Value::Null
                     } else {
@@ -3303,7 +3927,9 @@ impl HypergraphSQLEngine {
                 
                 // Save user patterns (Level 3) if loaded
                 if let Some(ref mut patterns) = tiered_guard.user_patterns {
-                    Arc::get_mut(patterns).unwrap().save_to_device()?;
+                    Arc::get_mut(patterns)
+                        .ok_or_else(|| anyhow::anyhow!("Failed to get mutable reference to user_patterns (multiple references exist)"))?
+                        .save_to_device()?;
                 }
                 
                 eprintln!("✅ Shutdown: Saved persistent hypergraph, promoted session cache, saved user patterns");

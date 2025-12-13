@@ -1,6 +1,7 @@
 pub mod parser;
 pub mod planner;
 pub mod plan;
+pub mod plan_validator;
 pub mod join_graph;
 pub mod join_order;
 pub mod cache;
@@ -20,6 +21,13 @@ pub mod wildcard_expansion;
 pub mod partition_pruning;
 pub mod index_selection;
 pub mod bitset_planner;
+pub mod bitset_cost_model;
+pub mod optimization_advanced;
+pub mod caching_advanced;
+
+// Bitset Engine V3 rules
+#[path = "rules/mod.rs"]
+pub mod bitset_rules_v3;
 pub mod memo;
 pub mod statistics;
 pub mod learned_ce;

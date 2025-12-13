@@ -29,7 +29,7 @@ impl Default for SpillConfig {
 
 /// Spill manager that monitors memory usage and spills batches to disk
 pub struct SpillManager {
-    cfg: SpillConfig,
+    pub cfg: SpillConfig,
     current_bytes: usize,
     spill_files: Vec<PathBuf>,
     /// Pending spill runs (for advanced spill with compression)

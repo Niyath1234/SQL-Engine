@@ -7,6 +7,7 @@ use arrow::datatypes::*;
 use std::sync::Arc;
 use anyhow::Result;
 use bitvec::prelude::*;
+use tracing::{warn, debug};
 
 /// HAVING operator - filters groups after aggregation
 pub struct HavingOperator {
@@ -105,7 +106,7 @@ impl BatchIterator for HavingOperator {
                     }
                     Err(e) => {
                         // Evaluation error - filter out this row and log error
-                        eprintln!("HAVING predicate evaluation error: {}", e);
+                        warn!(error = %e, "HAVING predicate evaluation error");
                         selection.push(false);
                     }
                 }
@@ -130,9 +131,11 @@ impl BatchIterator for HavingOperator {
         let input_schema = self.input.schema();
         
         // SCHEMA-FLOW DEBUG: Log schema propagation
-        eprintln!("DEBUG HavingOperator::schema() - Passing through input schema with {} fields: {:?}", 
-            input_schema.fields().len(),
-            input_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+        debug!(
+            field_count = input_schema.fields().len(),
+            field_names = ?input_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>(),
+            "HavingOperator::schema() - Passing through input schema"
+        );
         
         input_schema
     }

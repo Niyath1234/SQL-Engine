@@ -1,6 +1,7 @@
 pub mod columnar;
 pub mod fragment;
 pub mod compression;
+pub mod auto_compression;
 pub mod index;
 pub mod factorized;
 pub mod learned_index;
@@ -17,7 +18,12 @@ pub mod tiered_cache;
 pub mod partitioning;
 pub mod btree_index;
 pub mod bitset;
+pub mod bitset_v3;
+pub mod bitset_hierarchy;
+pub mod range_bitmap_index;
 pub mod bitmap_index;
+pub mod vector_search_optimized;
+pub mod hnsw_optimized;
 
 pub use columnar::*;
 pub use fragment::*;

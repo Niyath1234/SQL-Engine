@@ -1,0 +1,725 @@
+{
+  "schema_registry": {
+    "tables": {
+      "categories": {
+        "table_name": "categories",
+        "version": 1,
+        "columns": [
+          {
+            "name": "description",
+            "data_type": "Utf8",
+            "nullable": true,
+            "semantic_tags": [],
+            "description": null
+          },
+          {
+            "name": "id",
+            "data_type": "Int64",
+            "nullable": true,
+            "semantic_tags": [],
+            "description": null
+          },
+          {
+            "name": "name",
+            "data_type": "Utf8",
+            "nullable": true,
+            "semantic_tags": [],
+            "description": null
+          }
+        ],
+        "child_tables": [],
+        "created_at": 1765625221,
+        "updated_at": 1765625221
+      },
+      "order_items": {
+        "table_name": "order_items",
+        "version": 5,
+        "columns": [
+          {
+            "name": "order_id",
+            "data_type": "INT",
+            "nullable": false,
+            "semantic_tags": [
+              "key/natural"
+            ],
+            "description": null
+          },
+          {
+            "name": "price",
+            "data_type": "FLOAT",
+            "nullable": false,
+            "semantic_tags": [
+              "fact/amount"
+            ],
+            "description": null
+          },
+          {
+            "name": "product_id",
+            "data_type": "INT",
+            "nullable": false,
+            "semantic_tags": [
+              "key/natural"
+            ],
+            "description": null
+          },
+          {
+            "name": "quantity",
+            "data_type": "INT",
+            "nullable": false,
+            "semantic_tags": [],
+            "description": null
+          }
+        ],
+        "child_tables": [],
+        "created_at": 1765625221,
+        "updated_at": 1765625221
+      },
+      "products": {
+        "table_name": "products",
+        "version": 1,
+        "columns": [
+          {
+            "name": "category_id",
+            "data_type": "Int64",
+            "nullable": true,
+            "semantic_tags": [],
+            "description": null
+          },
+          {
+            "name": "created_at",
+            "data_type": "Utf8",
+            "nullable": true,
+            "semantic_tags": [],
+            "description": null
+          },
+          {
+            "name": "id",
+            "data_type": "Int64",
+            "nullable": true,
+            "semantic_tags": [],
+            "description": null
+          },
+          {
+            "name": "name",
+            "data_type": "Utf8",
+            "nullable": true,
+            "semantic_tags": [],
+            "description": null
+          },
+          {
+            "name": "price",
+            "data_type": "Float64",
+            "nullable": true,
+            "semantic_tags": [],
+            "description": null
+          }
+        ],
+        "child_tables": [],
+        "created_at": 1765625221,
+        "updated_at": 1765625221
+      },
+      "orders": {
+        "table_name": "orders",
+        "version": 1,
+        "columns": [
+          {
+            "name": "customer_id",
+            "data_type": "Int64",
+            "nullable": true,
+            "semantic_tags": [],
+            "description": null
+          },
+          {
+            "name": "id",
+            "data_type": "Int64",
+            "nullable": true,
+            "semantic_tags": [],
+            "description": null
+          },
+          {
+            "name": "order_date",
+            "data_type": "Utf8",
+            "nullable": true,
+            "semantic_tags": [],
+            "description": null
+          },
+          {
+            "name": "status",
+            "data_type": "Utf8",
+            "nullable": true,
+            "semantic_tags": [],
+            "description": null
+          },
+          {
+            "name": "total_amount",
+            "data_type": "Float64",
+            "nullable": true,
+            "semantic_tags": [],
+            "description": null
+          }
+        ],
+        "child_tables": [],
+        "created_at": 1765625221,
+        "updated_at": 1765625221
+      },
+      "customers": {
+        "table_name": "customers",
+        "version": 1,
+        "columns": [
+          {
+            "name": "created_at",
+            "data_type": "Utf8",
+            "nullable": true,
+            "semantic_tags": [],
+            "description": null
+          },
+          {
+            "name": "email",
+            "data_type": "Utf8",
+            "nullable": true,
+            "semantic_tags": [],
+            "description": null
+          },
+          {
+            "name": "id",
+            "data_type": "Int64",
+            "nullable": true,
+            "semantic_tags": [],
+            "description": null
+          },
+          {
+            "name": "name",
+            "data_type": "Utf8",
+            "nullable": true,
+            "semantic_tags": [],
+            "description": null
+          }
+        ],
+        "child_tables": [],
+        "created_at": 1765625221,
+        "updated_at": 1765625221
+      }
+    }
+  },
+  "key_registry": {
+    "tables": {
+      "orders": {
+        "primary_key": {
+          "columns": [
+            "id"
+          ],
+          "is_synthetic": false
+        },
+        "natural_keys": [],
+        "event_time": null,
+        "updated_at": null,
+        "dedupe_strategy": "AppendOnly"
+      },
+      "customers": {
+        "primary_key": {
+          "columns": [
+            "id"
+          ],
+          "is_synthetic": false
+        },
+        "natural_keys": [],
+        "event_time": null,
+        "updated_at": null,
+        "dedupe_strategy": "AppendOnly"
+      },
+      "products": {
+        "primary_key": {
+          "columns": [
+            "id"
+          ],
+          "is_synthetic": false
+        },
+        "natural_keys": [],
+        "event_time": null,
+        "updated_at": null,
+        "dedupe_strategy": "AppendOnly"
+      },
+      "categories": {
+        "primary_key": {
+          "columns": [
+            "id"
+          ],
+          "is_synthetic": false
+        },
+        "natural_keys": [],
+        "event_time": null,
+        "updated_at": null,
+        "dedupe_strategy": "AppendOnly"
+      }
+    }
+  },
+  "rule_registry": {
+    "rules": {},
+    "table_pairs": {}
+  },
+  "filter_rule_registry": {
+    "rules": {},
+    "table_rules": {}
+  },
+  "stats_registry": {
+    "tables": {
+      "orders": {
+        "table_name": "orders",
+        "row_count": 7,
+        "column_stats": {
+          "customer_id": {
+            "column": "customer_id",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          },
+          "id": {
+            "column": "id",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          },
+          "status": {
+            "column": "status",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          },
+          "order_date": {
+            "column": "order_date",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          },
+          "total_amount": {
+            "column": "total_amount",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          }
+        },
+        "updated_at": 1765625221
+      },
+      "customers": {
+        "table_name": "customers",
+        "row_count": 5,
+        "column_stats": {
+          "email": {
+            "column": "email",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          },
+          "created_at": {
+            "column": "created_at",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          },
+          "name": {
+            "column": "name",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          },
+          "id": {
+            "column": "id",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          }
+        },
+        "updated_at": 1765625221
+      },
+      "order_items": {
+        "table_name": "order_items",
+        "row_count": 10,
+        "column_stats": {
+          "price": {
+            "column": "price",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          },
+          "quantity": {
+            "column": "quantity",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          },
+          "product_id": {
+            "column": "product_id",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          },
+          "order_id": {
+            "column": "order_id",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          }
+        },
+        "updated_at": 1765625221
+      },
+      "categories": {
+        "table_name": "categories",
+        "row_count": 3,
+        "column_stats": {
+          "description": {
+            "column": "description",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          },
+          "id": {
+            "column": "id",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          },
+          "name": {
+            "column": "name",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          }
+        },
+        "updated_at": 1765625221
+      },
+      "products": {
+        "table_name": "products",
+        "row_count": 10,
+        "column_stats": {
+          "price": {
+            "column": "price",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          },
+          "created_at": {
+            "column": "created_at",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          },
+          "id": {
+            "column": "id",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          },
+          "name": {
+            "column": "name",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          },
+          "category_id": {
+            "column": "category_id",
+            "ndv": null,
+            "null_rate": 0.0,
+            "min_value": null,
+            "max_value": null,
+            "updated_at": 1765625221
+          }
+        },
+        "updated_at": 1765625221
+      }
+    }
+  },
+  "lineage_registry": {
+    "sources": {
+      "customers_api": {
+        "source_id": "customers_api",
+        "source_type": "json",
+        "uri": null,
+        "created_at": 1765622613
+      },
+      "categories_api": {
+        "source_id": "categories_api",
+        "source_type": "json",
+        "uri": null,
+        "created_at": 1765622613
+      },
+      "orders_api": {
+        "source_id": "orders_api",
+        "source_type": "json",
+        "uri": null,
+        "created_at": 1765622613
+      },
+      "order_items_api": {
+        "source_id": "order_items_api",
+        "source_type": "json",
+        "uri": null,
+        "created_at": 1765622613
+      },
+      "products_api": {
+        "source_id": "products_api",
+        "source_type": "json",
+        "uri": null,
+        "created_at": 1765622613
+      }
+    },
+    "runs": {
+      "ae4c0c2e-5448-4d6f-8a47-ec921e1b6bfd": {
+        "run_id": "ae4c0c2e-5448-4d6f-8a47-ec921e1b6bfd",
+        "source_id": "products_api",
+        "started_at": 1765622613,
+        "ended_at": 1765622613,
+        "records_ingested": 10,
+        "status": "completed",
+        "error": null
+      },
+      "9fd30c61-5760-4671-8534-a8c8c0c7ed11": {
+        "run_id": "9fd30c61-5760-4671-8534-a8c8c0c7ed11",
+        "source_id": "products_api",
+        "started_at": 1765622844,
+        "ended_at": 1765622844,
+        "records_ingested": 10,
+        "status": "completed",
+        "error": null
+      },
+      "53a56dea-07ea-46b6-863c-501659b17764": {
+        "run_id": "53a56dea-07ea-46b6-863c-501659b17764",
+        "source_id": "orders_api",
+        "started_at": 1765625221,
+        "ended_at": 1765625221,
+        "records_ingested": 7,
+        "status": "completed",
+        "error": null
+      },
+      "28c255af-f739-4eb4-8e16-6d67beccf2a8": {
+        "run_id": "28c255af-f739-4eb4-8e16-6d67beccf2a8",
+        "source_id": "order_items_api",
+        "started_at": 1765625221,
+        "ended_at": 1765625221,
+        "records_ingested": 10,
+        "status": "completed",
+        "error": null
+      },
+      "47319811-394a-4501-bc38-4183174b8462": {
+        "run_id": "47319811-394a-4501-bc38-4183174b8462",
+        "source_id": "orders_api",
+        "started_at": 1765622613,
+        "ended_at": 1765622613,
+        "records_ingested": 7,
+        "status": "completed",
+        "error": null
+      },
+      "aa6a6a6d-13b3-458e-a79a-f0070d1c3a89": {
+        "run_id": "aa6a6a6d-13b3-458e-a79a-f0070d1c3a89",
+        "source_id": "categories_api",
+        "started_at": 1765622613,
+        "ended_at": 1765622613,
+        "records_ingested": 3,
+        "status": "completed",
+        "error": null
+      },
+      "8d92101e-a9cf-457c-b1f8-f47ddd70b741": {
+        "run_id": "8d92101e-a9cf-457c-b1f8-f47ddd70b741",
+        "source_id": "categories_api",
+        "started_at": 1765622844,
+        "ended_at": 1765622844,
+        "records_ingested": 3,
+        "status": "completed",
+        "error": null
+      },
+      "18004ae8-b23f-4981-8450-ca18e0b1c4c4": {
+        "run_id": "18004ae8-b23f-4981-8450-ca18e0b1c4c4",
+        "source_id": "categories_api",
+        "started_at": 1765625221,
+        "ended_at": 1765625221,
+        "records_ingested": 3,
+        "status": "completed",
+        "error": null
+      },
+      "7a348a5e-baca-4d0d-94d7-c8ba73835a3c": {
+        "run_id": "7a348a5e-baca-4d0d-94d7-c8ba73835a3c",
+        "source_id": "customers_api",
+        "started_at": 1765625221,
+        "ended_at": 1765625221,
+        "records_ingested": 5,
+        "status": "completed",
+        "error": null
+      },
+      "ce6b7251-ac46-48e5-9630-b5261dd0da7e": {
+        "run_id": "ce6b7251-ac46-48e5-9630-b5261dd0da7e",
+        "source_id": "customers_api",
+        "started_at": 1765622613,
+        "ended_at": 1765622613,
+        "records_ingested": 5,
+        "status": "completed",
+        "error": null
+      },
+      "33526093-b37b-4695-ad5e-bd26f19ae949": {
+        "run_id": "33526093-b37b-4695-ad5e-bd26f19ae949",
+        "source_id": "products_api",
+        "started_at": 1765625221,
+        "ended_at": 1765625221,
+        "records_ingested": 10,
+        "status": "completed",
+        "error": null
+      },
+      "4b2eb82e-c7c2-425d-b4a7-732a9e746cc5": {
+        "run_id": "4b2eb82e-c7c2-425d-b4a7-732a9e746cc5",
+        "source_id": "orders_api",
+        "started_at": 1765622844,
+        "ended_at": 1765622844,
+        "records_ingested": 7,
+        "status": "completed",
+        "error": null
+      },
+      "23a2726c-086f-4af9-9b1e-567040c992bb": {
+        "run_id": "23a2726c-086f-4af9-9b1e-567040c992bb",
+        "source_id": "customers_api",
+        "started_at": 1765622844,
+        "ended_at": 1765622844,
+        "records_ingested": 5,
+        "status": "completed",
+        "error": null
+      },
+      "72c293c0-4538-434c-b75c-719df9eb7e11": {
+        "run_id": "72c293c0-4538-434c-b75c-719df9eb7e11",
+        "source_id": "order_items_api",
+        "started_at": 1765622844,
+        "ended_at": 1765622844,
+        "records_ingested": 10,
+        "status": "completed",
+        "error": null
+      },
+      "93ef3f2a-7872-4dd1-b418-9bb734e093b5": {
+        "run_id": "93ef3f2a-7872-4dd1-b418-9bb734e093b5",
+        "source_id": "order_items_api",
+        "started_at": 1765622613,
+        "ended_at": 1765622613,
+        "records_ingested": 10,
+        "status": "completed",
+        "error": null
+      }
+    },
+    "table_lineage": {
+      "customers": {
+        "table_name": "customers",
+        "source_id": "customers_api",
+        "schema_version": 5,
+        "ingestion_runs": [
+          "ce6b7251-ac46-48e5-9630-b5261dd0da7e",
+          "23a2726c-086f-4af9-9b1e-567040c992bb",
+          "7a348a5e-baca-4d0d-94d7-c8ba73835a3c"
+        ],
+        "created_at": 1765622613,
+        "updated_at": 1765625221
+      },
+      "products": {
+        "table_name": "products",
+        "source_id": "products_api",
+        "schema_version": 6,
+        "ingestion_runs": [
+          "ae4c0c2e-5448-4d6f-8a47-ec921e1b6bfd",
+          "9fd30c61-5760-4671-8534-a8c8c0c7ed11",
+          "33526093-b37b-4695-ad5e-bd26f19ae949"
+        ],
+        "created_at": 1765622613,
+        "updated_at": 1765625221
+      },
+      "orders": {
+        "table_name": "orders",
+        "source_id": "orders_api",
+        "schema_version": 6,
+        "ingestion_runs": [
+          "47319811-394a-4501-bc38-4183174b8462",
+          "4b2eb82e-c7c2-425d-b4a7-732a9e746cc5",
+          "53a56dea-07ea-46b6-863c-501659b17764"
+        ],
+        "created_at": 1765622613,
+        "updated_at": 1765625221
+      },
+      "order_items": {
+        "table_name": "order_items",
+        "source_id": "order_items_api",
+        "schema_version": 5,
+        "ingestion_runs": [
+          "93ef3f2a-7872-4dd1-b418-9bb734e093b5",
+          "72c293c0-4538-434c-b75c-719df9eb7e11",
+          "28c255af-f739-4eb4-8e16-6d67beccf2a8"
+        ],
+        "created_at": 1765622613,
+        "updated_at": 1765625221
+      },
+      "categories": {
+        "table_name": "categories",
+        "source_id": "categories_api",
+        "schema_version": 4,
+        "ingestion_runs": [
+          "aa6a6a6d-13b3-458e-a79a-f0070d1c3a89",
+          "8d92101e-a9cf-457c-b1f8-f47ddd70b741",
+          "18004ae8-b23f-4981-8450-ca18e0b1c4c4"
+        ],
+        "created_at": 1765622613,
+        "updated_at": 1765625221
+      }
+    }
+  },
+  "policy_registry": {
+    "rbac_policies": {},
+    "sql_policies": {},
+    "query_policies": {},
+    "default_sql_policy": {
+      "allowed_verbs": [
+        "WITH",
+        "SELECT"
+      ],
+      "allow_ddl": false,
+      "allow_dml": false
+    },
+    "default_query_policy": {
+      "max_rows": 10000,
+      "max_time_ms": 30000,
+      "max_cost": null,
+      "allow_approximate": false
+    }
+  },
+  "version": 78,
+  "last_updated": 1765625221
+}

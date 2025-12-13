@@ -164,12 +164,13 @@ impl WCOJJoinOperator {
             .min_by_key(|(_, trie)| trie.values().len())
             .map(|(idx, _)| idx);
         
-        if smallest_trie_idx.is_none() {
-            self.state.finished = true;
-            return Ok(false);
-        }
-        
-        let smallest_idx = smallest_trie_idx.unwrap();
+        let smallest_idx = match smallest_trie_idx {
+            Some(idx) => idx,
+            None => {
+                self.state.finished = true;
+                return Ok(false);
+            }
+        };
         let smallest_trie = &self.tries[smallest_idx];
         let values = smallest_trie.values();
         

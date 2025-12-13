@@ -1,5 +1,5 @@
 use hypergraph_sql_engine::engine::HypergraphSQLEngine;
-use std::io::{self, Write};
+use std::io::{self, Write, BufRead};
 use std::fs::File;
 use csv::ReaderBuilder;
 use arrow::array::*;
@@ -66,6 +66,7 @@ fn load_csv(path: &str) -> anyhow::Result<(usize, Vec<String>, Vec<(String, hype
                 memory_size: 0,
                 table_name: None,
                 column_name: None,
+                metadata: std::collections::HashMap::new(),
             }
         );
         

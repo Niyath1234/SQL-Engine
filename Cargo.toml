@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# HTTP client for Ollama
+reqwest = { version = "0.11", features = ["json"] }
 # SQL Parsing
 sqlparser = "0.40"
 
@@ -45,12 +47,18 @@ tempfile = "3.8" # Temporary directory for tests
 # Error Handling
 anyhow = "1"
 thiserror = "1"
+toml = "0.8"
+
+# Async Runtime
+async-trait = "0.1"
 
 # WASM JIT Compilation
 wasmtime = "23.0"
 
 # Async runtime (needed for PostgreSQL and DuckDB)
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+bytes = "1.5"
 
 # Web framework for admin UI
 axum = "0.7"
@@ -96,6 +104,98 @@ path = "src/bin/sql_repl.rs"
 name = "benchmark"
 path = "src/bin/benchmark.rs"
 
+[[bin]]
+name = "tpc_benchmark"
+path = "src/bin/tpc_benchmark.rs"
+
+[[bin]]
+name = "benchmark_speed_validation"
+path = "src/bin/benchmark_speed_validation.rs"
+
+[[bin]]
+name = "test_simd_direct"
+path = "src/bin/test_simd_direct.rs"
+
+[[bin]]
+name = "phase4_integration_test"
+path = "src/bin/phase4_integration_test.rs"
+
+[[bin]]
+name = "phase4_production_benchmark"
+path = "src/bin/phase4_production_benchmark.rs"
+
+[[bin]]
+name = "phase4_test_data_generator"
+path = "src/bin/phase4_test_data_generator.rs"
+
+[[bin]]
+name = "phase6_bitset_v3_benchmark"
+path = "src/bin/phase6_bitset_v3_benchmark.rs"
+
+[[bin]]
+name = "phase6_integration_test"
+path = "src/bin/phase6_integration_test.rs"
+
+[[bin]]
+name = "phase7_vector_benchmark"
+path = "src/bin/phase7_vector_benchmark.rs"
+
+[[bin]]
+name = "phase7_memory_benchmark"
+path = "src/bin/phase7_memory_benchmark.rs"
+
+[[bin]]
+name = "phase7_query_optimization_benchmark"
+path = "src/bin/phase7_query_optimization_benchmark.rs"
+
+[[bin]]
+name = "test_simple_query"
+path = "src/bin/test_simple_query.rs"
+
+[[bin]]
+name = "test_sum_avg"
+path = "src/bin/test_sum_avg.rs"
+
+[[bin]]
+name = "test_full_llm_pipeline"
+path = "src/bin/test_full_llm_pipeline.rs"
+
+[[bin]]
+name = "test_complex_query"
+path = "src/bin/test_complex_query.rs"
+
+[[bin]]
+name = "test_extensive"
+path = "src/bin/test_extensive.rs"
+
+[[bin]]
+name = "test_70_percent"
+path = "src/bin/test_70_percent.rs"
+
+[[bin]]
+name = "test_easy_medium_sql"
+path = "src/bin/test_easy_medium_sql.rs"
+
+[[bin]]
+name = "test_phase1_worldstate"
+path = "src/bin/test_phase1_worldstate.rs"
+
+[[bin]]
+name = "test_phase2_ingestion"
+path = "src/bin/test_phase2_ingestion.rs"
+
+[[bin]]
+name = "test_phase3_join_rules"
+path = "src/bin/test_phase3_join_rules.rs"
+
+[[bin]]
+name = "test_phase5_llm_cortex"
+path = "src/bin/test_phase5_llm_cortex.rs"
+
+[[bin]]
+name = "test_phase5_full_pipeline"
+path = "src/bin/test_phase5_full_pipeline.rs"
+
 
 # Removed binary targets for non-existent test files
 # [[bin]]
@@ -134,4 +234,8 @@ path = "src/bin/benchmark.rs"
 # [[bin]]
 # name = "test_query4_standalone"
 # path = "test_query4_standalone.rs"
+
+[[example]]
+name = "basic_usage"
+path = "examples/basic_usage.rs"
 

@@ -77,6 +77,26 @@ pub struct FragmentMetadata {
     /// Column name (for bitmap index building)
     #[serde(default)]
     pub column_name: Option<String>,
+    
+    /// Additional metadata (key-value pairs)
+    #[serde(default)]
+    pub metadata: std::collections::HashMap<String, String>,
+}
+
+impl Default for FragmentMetadata {
+    fn default() -> Self {
+        Self {
+            row_count: 0,
+            min_value: None,
+            max_value: None,
+            cardinality: 0,
+            compression: CompressionType::None,
+            memory_size: 0,
+            table_name: None,
+            column_name: None,
+            metadata: std::collections::HashMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

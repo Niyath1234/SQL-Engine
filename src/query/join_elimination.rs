@@ -14,6 +14,11 @@ pub fn eliminate_redundant_joins(plan: &mut PlanOperator) -> bool {
             let right_changed = eliminate_redundant_joins(right);
             changed = left_changed || right_changed;
             
+            // CRITICAL FIX: Don't eliminate joins that are required for the query
+            // The can_eliminate_join function is too aggressive and removes required joins
+            // For now, skip join elimination entirely - it's an optimization, not required for correctness
+            // TODO: Fix can_eliminate_join to correctly identify truly redundant joins
+            /*
             // Check if this join can be eliminated
             if can_eliminate_join(left, right, predicate) {
                 // Replace join with left side (assuming left is the fact table)
@@ -22,6 +27,7 @@ pub fn eliminate_redundant_joins(plan: &mut PlanOperator) -> bool {
                 *plan = *left.clone();
                 changed = true;
             }
+            */
         }
         PlanOperator::BitsetJoin { left, right, predicate, .. } => {
             let left_changed = eliminate_redundant_joins(left);

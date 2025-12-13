@@ -91,7 +91,10 @@ impl SharedScanOperator {
         }
         
         // Extract batch for this query
-        let mut batch = self.current_batch.as_ref().unwrap().clone();
+        // Safe to unwrap: we check is_none() above
+        let mut batch = self.current_batch.as_ref()
+            .expect("current_batch should be Some after is_none() check")
+            .clone();
         
         // Apply this query's selection
         if query_idx < self.query_selections.len() {
@@ -106,7 +109,9 @@ impl SharedScanOperator {
     }
     
     fn compute_query_selections(&mut self) -> Result<()> {
-        let batch = self.current_batch.as_ref().unwrap();
+        // Safe to unwrap: this is only called when current_batch is Some
+        let batch = self.current_batch.as_ref()
+            .expect("current_batch should be Some when compute_query_selections is called");
         self.query_selections.clear();
         
         for query in &self.queries {

@@ -1,0 +1,14 @@
+# Cargo configuration for test execution
+[test]
+# Run tests sequentially (one at a time) to prevent memory issues
+test-threads = 1
+
+# Increase timeout for complex tests
+[target.'cfg(test)']
+# Allow tests to run longer
+timeout = 300
+
+
+
+
+

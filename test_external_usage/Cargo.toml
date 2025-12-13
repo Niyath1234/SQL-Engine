@@ -1,0 +1,9 @@
+[package]
+name = "test-external-usage"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hypergraph-sql-engine = { path = ".." }
+anyhow = "1"
+

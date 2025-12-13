@@ -91,13 +91,14 @@ impl WALManager {
     
     /// Write a WAL entry
     pub fn write_entry(&self, entry_type: WALEntryType) -> Result<u64> {
-        let mut seq = self.sequence_number.write().unwrap();
+        let mut seq = self.sequence_number.write()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire sequence number lock: {}", e))?;
         let sequence = *seq;
         *seq += 1;
         
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .map_err(|e| anyhow::anyhow!("System time is before UNIX epoch: {}", e))?
             .as_millis() as u64;
         
         let entry = WALEntry {
@@ -108,7 +109,8 @@ impl WALManager {
         
         // Serialize and write to WAL
         let json = serde_json::to_string(&entry)?;
-        let mut writer = self.writer.write().unwrap();
+        let mut writer = self.writer.write()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire writer lock: {}", e))?;
         if let Some(ref mut w) = *writer {
             writeln!(w, "{}", json)?;
             w.flush()?;
@@ -164,7 +166,8 @@ impl WALManager {
     
     /// Close WAL file
     pub fn close(&self) -> Result<()> {
-        let mut writer = self.writer.write().unwrap();
+        let mut writer = self.writer.write()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire writer lock: {}", e))?;
         if let Some(ref mut w) = *writer {
             w.flush()?;
         }
@@ -176,7 +179,9 @@ impl WALManager {
 impl Default for WALManager {
     fn default() -> Self {
         // Default to current directory
-        Self::new(PathBuf::from(".")).unwrap()
+        // If this fails, we can't create a default WAL manager
+        Self::new(PathBuf::from("."))
+            .expect("Failed to create default WAL manager in current directory")
     }
 }
 

@@ -65,7 +65,9 @@ impl SessionWorkingSet {
             );
         }
         
-        self.plan_caches.get_mut(session_id).unwrap()
+        // Safe to unwrap: we just inserted if it didn't exist
+        self.plan_caches.get_mut(session_id)
+            .expect("Plan cache should exist after insertion")
     }
     
     /// Get or create result cache for a session
@@ -80,7 +82,9 @@ impl SessionWorkingSet {
             );
         }
         
-        self.result_caches.get_mut(session_id).unwrap()
+        // Safe to unwrap: we just inserted if it didn't exist
+        self.result_caches.get_mut(session_id)
+            .expect("Result cache should exist after insertion")
     }
     
     /// Record fragment access for a session
@@ -142,9 +146,10 @@ impl SessionWorkingSet {
     
     /// Update last access time for a session
     fn update_access_time(&mut self, session_id: &str) {
+        // SystemTime::now() should always be after UNIX_EPOCH
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("System time is before UNIX epoch - this should never happen")
             .as_secs();
         self.last_access.insert(session_id.to_string(), now);
     }
@@ -168,9 +173,10 @@ impl SessionWorkingSet {
     
     /// Clean up expired sessions
     pub fn cleanup_expired(&mut self) {
+        // SystemTime::now() should always be after UNIX_EPOCH
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("System time is before UNIX epoch - this should never happen")
             .as_secs();
         
         let expired: Vec<String> = self.last_access

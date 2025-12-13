@@ -3,10 +3,27 @@
 use crate::storage::fragment::Value;
 use crate::hypergraph::graph::HyperGraph;
 use crate::hypergraph::node::NodeId;
+use crate::error::EngineError;
 use anyhow::Result;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, PoisonError};
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{error, warn};
+
+// Safe lock helpers - convert poisoning errors to proper errors
+fn safe_read_lock<T>(lock: &RwLock<T>) -> Result<RwLockReadGuard<T>> {
+    lock.read().map_err(|e: PoisonError<_>| {
+        error!("RwLock read lock poisoned: {}", e);
+        anyhow::anyhow!("Lock poisoning detected: {}", e)
+    })
+}
+
+fn safe_write_lock<T>(lock: &RwLock<T>) -> Result<RwLockWriteGuard<T>> {
+    lock.write().map_err(|e: PoisonError<_>| {
+        error!("RwLock write lock poisoned: {}", e);
+        anyhow::anyhow!("Lock poisoning detected: {}", e)
+    })
+}
 
 /// Transaction isolation level
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,17 +140,17 @@ impl TransactionManager {
     
     /// Begin a new transaction
     pub fn begin(&self, isolation_level: IsolationLevel) -> Result<u64> {
-        let mut next_id = self.next_txn_id.write().unwrap();
+        let mut next_id = safe_write_lock(&self.next_txn_id)?;
         let txn_id = *next_id;
         *next_id += 1;
         
         let transaction = Transaction::new(txn_id, isolation_level);
-        let mut transactions = self.transactions.write().unwrap();
+        let mut transactions = safe_write_lock(&self.transactions)?;
         transactions.insert(txn_id, transaction);
         
         // Create MVCC snapshot for transaction (for RepeatableRead and Serializable)
         if matches!(isolation_level, IsolationLevel::RepeatableRead | IsolationLevel::Serializable) {
-            let mut snapshots = self.snapshots.write().unwrap();
+            let mut snapshots = safe_write_lock(&self.snapshots)?;
             snapshots.insert(txn_id, HashMap::new()); // Snapshot will be populated on first read
         }
         
@@ -148,7 +165,7 @@ impl TransactionManager {
     /// Commit a transaction (ensures atomicity)
     pub fn commit(&self, txn_id: u64) -> Result<()> {
         // Check for conflicts based on isolation level (consistency check)
-        let transactions = self.transactions.read().unwrap();
+        let transactions = safe_read_lock(&self.transactions)?;
         let txn = transactions.get(&txn_id)
             .ok_or_else(|| anyhow::anyhow!("Transaction {} not found", txn_id))?;
         
@@ -175,19 +192,19 @@ impl TransactionManager {
         }
         
         // Atomically commit transaction
-        let mut transactions = self.transactions.write().unwrap();
+        let mut transactions = safe_write_lock(&self.transactions)?;
         if let Some(txn) = transactions.get_mut(&txn_id) {
             // Release locks
             drop(transactions);
             self.release_locks(txn_id)?;
             
-            let mut transactions = self.transactions.write().unwrap();
+            let mut transactions = safe_write_lock(&self.transactions)?;
             if let Some(txn) = transactions.get_mut(&txn_id) {
                 txn.commit();
             }
             
             // Remove snapshot
-            let mut snapshots = self.snapshots.write().unwrap();
+            let mut snapshots = safe_write_lock(&self.snapshots)?;
             snapshots.remove(&txn_id);
         }
         
@@ -201,7 +218,7 @@ impl TransactionManager {
             wal.write_entry(crate::execution::wal::WALEntryType::Rollback { txn_id })?;
         }
         
-        let mut transactions = self.transactions.write().unwrap();
+        let mut transactions = safe_write_lock(&self.transactions)?;
         if let Some(txn) = transactions.get_mut(&txn_id) {
             if !txn.is_active() {
                 anyhow::bail!("Transaction {} is not active", txn_id);
@@ -211,13 +228,13 @@ impl TransactionManager {
             drop(transactions);
             self.release_locks(txn_id)?;
             
-            let mut transactions = self.transactions.write().unwrap();
+            let mut transactions = safe_write_lock(&self.transactions)?;
             if let Some(txn) = transactions.get_mut(&txn_id) {
                 txn.rollback();
             }
             
             // Remove snapshot
-            let mut snapshots = self.snapshots.write().unwrap();
+            let mut snapshots = safe_write_lock(&self.snapshots)?;
             snapshots.remove(&txn_id);
         } else {
             anyhow::bail!("Transaction {} not found", txn_id)
@@ -229,14 +246,14 @@ impl TransactionManager {
     /// Acquire a lock on a table (with isolation level awareness)
     pub fn acquire_table_lock(&self, txn_id: u64, table_name: &str, lock_type: LockType) -> Result<()> {
         // Get transaction to check isolation level
-        let transactions = self.transactions.read().unwrap();
+        let transactions = safe_read_lock(&self.transactions)?;
         let txn = transactions.get(&txn_id)
             .ok_or_else(|| anyhow::anyhow!("Transaction {} not found", txn_id))?;
         
         let isolation = txn.isolation_level;
         drop(transactions);
         
-        let mut locks = self.table_locks.write().unwrap();
+        let mut locks = safe_write_lock(&self.table_locks)?;
         
         // Isolation level-specific locking behavior
         match isolation {
@@ -291,7 +308,7 @@ impl TransactionManager {
     
     /// Check for serializability conflicts
     fn check_serializability_conflicts(&self, txn_id: u64, txn: &Transaction) -> Result<()> {
-        let transactions = self.transactions.read().unwrap();
+        let transactions = safe_read_lock(&self.transactions)?;
         
         // Check for write-write conflicts with other active transactions
         for (other_txn_id, other_txn) in transactions.iter() {
@@ -325,7 +342,7 @@ impl TransactionManager {
     
     /// Acquire a lock on a row
     pub fn acquire_row_lock(&self, txn_id: u64, table_name: &str, row_id: usize) -> Result<()> {
-        let mut locks = self.row_locks.write().unwrap();
+        let mut locks = safe_write_lock(&self.row_locks)?;
         let key = (table_name.to_string(), row_id);
         
         if let Some(existing_txn_id) = locks.get(&key) {
@@ -340,8 +357,8 @@ impl TransactionManager {
     
     /// Release all locks for a transaction
     fn release_locks(&self, txn_id: u64) -> Result<()> {
-        let mut table_locks = self.table_locks.write().unwrap();
-        let mut row_locks = self.row_locks.write().unwrap();
+        let mut table_locks = safe_write_lock(&self.table_locks)?;
+        let mut row_locks = safe_write_lock(&self.row_locks)?;
         
         // Remove table locks
         table_locks.retain(|_, (id, _)| *id != txn_id);
@@ -354,7 +371,7 @@ impl TransactionManager {
     
     /// Get transaction
     pub fn get_transaction(&self, txn_id: u64) -> Option<Transaction> {
-        let transactions = self.transactions.read().unwrap();
+        let transactions = safe_read_lock(&self.transactions).ok()?;
         transactions.get(&txn_id).cloned()
     }
     
@@ -369,7 +386,7 @@ impl TransactionManager {
     
     /// Mark table as modified in transaction
     pub fn mark_table_modified(&self, txn_id: u64, table_name: &str) -> Result<()> {
-        let mut transactions = self.transactions.write().unwrap();
+        let mut transactions = safe_write_lock(&self.transactions)?;
         if let Some(txn) = transactions.get_mut(&txn_id) {
             txn.modified_tables.insert(table_name.to_string());
             Ok(())
@@ -380,7 +397,7 @@ impl TransactionManager {
     
     /// Track a read operation (for conflict detection)
     pub fn track_read(&self, txn_id: u64, table_name: &str, row_id: usize) -> Result<()> {
-        let mut transactions = self.transactions.write().unwrap();
+        let mut transactions = safe_write_lock(&self.transactions)?;
         if let Some(txn) = transactions.get_mut(&txn_id) {
             txn.read_set.insert((table_name.to_string(), row_id));
             Ok(())
@@ -391,7 +408,7 @@ impl TransactionManager {
     
     /// Track a write operation (for conflict detection)
     pub fn track_write(&self, txn_id: u64, table_name: &str, row_id: usize) -> Result<()> {
-        let mut transactions = self.transactions.write().unwrap();
+        let mut transactions = safe_write_lock(&self.transactions)?;
         if let Some(txn) = transactions.get_mut(&txn_id) {
             txn.write_set.insert((table_name.to_string(), row_id));
             Ok(())
@@ -402,13 +419,13 @@ impl TransactionManager {
     
     /// Get MVCC snapshot for transaction
     pub fn get_snapshot(&self, txn_id: u64) -> Option<HashMap<String, Vec<Value>>> {
-        let snapshots = self.snapshots.read().unwrap();
+        let snapshots = safe_read_lock(&self.snapshots).ok()?;
         snapshots.get(&txn_id).cloned()
     }
     
     /// Set MVCC snapshot for transaction
     pub fn set_snapshot(&self, txn_id: u64, snapshot: HashMap<String, Vec<Value>>) -> Result<()> {
-        let mut snapshots = self.snapshots.write().unwrap();
+        let mut snapshots = safe_write_lock(&self.snapshots)?;
         snapshots.insert(txn_id, snapshot);
         Ok(())
     }

@@ -89,6 +89,12 @@ impl ResultCache {
         }
     }
     
+    /// Clear all cached results
+    pub fn clear(&mut self) {
+        self.cache.clear();
+        self.current_memory_bytes = 0;
+    }
+    
     /// Estimate memory size of batches in bytes
     fn estimate_memory_size(batches: &[ExecutionBatch]) -> usize {
         batches.iter().map(|batch| {
@@ -138,16 +144,9 @@ impl ResultCache {
     }
     
     /// Invalidate cache for a table (when table is updated)
-    pub fn invalidate_table(&mut self, table: &str) {
+    pub fn invalidate_table(&mut self, _table: &str) {
         // TODO: Remove entries that reference this table
-        self.cache.clear(); // Simple: clear all for now
-        self.current_memory_bytes = 0;
-    }
-    
-    /// Clear all cached results (for benchmarking)
-    pub fn clear(&mut self) {
-        self.cache.clear();
-        self.current_memory_bytes = 0;
+        self.clear(); // Use clear() method
     }
     
     /// Get cache size

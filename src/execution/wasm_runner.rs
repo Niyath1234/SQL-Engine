@@ -4,6 +4,7 @@ use wasmtime::*;
 use arrow::record_batch::RecordBatch;
 use anyhow::Result;
 use std::sync::Arc;
+use tracing::warn;
 
 /// WASM runner for executing compiled expressions
 pub struct WasmRunner {
@@ -50,7 +51,7 @@ impl WasmRunner {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     // WASM execution failed, fall back to interpreter
-                    eprintln!("WASM execution failed, falling back to interpreter: {}", e);
+                    warn!(error = %e, "WASM execution failed, falling back to interpreter");
                     return self.fallback_to_interpreter(wasm_bytes, input);
                 }
             }

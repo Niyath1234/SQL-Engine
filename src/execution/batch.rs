@@ -6,6 +6,7 @@ use arrow::datatypes::*;
 use std::sync::Arc;
 use bitvec::prelude::*;
 use std::collections::HashMap;
+use tracing::trace;
 
 /// Execution batch - optimized batch for execution pipeline
 /// Uses SIMD-friendly layouts and zero-copy where possible
@@ -146,11 +147,29 @@ impl ExecutionBatch {
     
     /// Apply selection vector (filter rows)
     pub fn apply_selection(&mut self, new_selection: &bitvec::prelude::BitVec) {
+        let old_selection_len = self.selection.len();
         self.selection = new_selection.clone();
         let old_row_count = self.row_count;
         self.row_count = self.selection.count_ones();
-        eprintln!("DEBUG ExecutionBatch::apply_selection: old_row_count={}, new_row_count={}, selection.count_ones()={}", 
-            old_row_count, self.row_count, self.selection.count_ones());
+        trace!(
+            old_selection_len = old_selection_len,
+            new_selection_len = self.selection.len(),
+            old_row_count = old_row_count,
+            new_row_count = self.row_count,
+            selection_count = self.selection.count_ones(),
+            "ExecutionBatch::apply_selection"
+        );
+        
+        // Debug: Show which bits are set
+        let set_bits: Vec<usize> = self.selection.iter()
+            .enumerate()
+            .filter_map(|(i, b)| if *b { Some(i) } else { None })
+            .take(10)
+            .collect();
+        trace!(
+            first_10_set_bits = ?set_bits,
+            "ExecutionBatch::apply_selection: First 10 set bits"
+        );
     }
     
     /// Get selected row count
@@ -163,13 +182,60 @@ impl ExecutionBatch {
         self.row_count == 0
     }
     
-    /// Slice batch (zero-copy)
+    /// Slice batch to get a specific number of SELECTED rows
+    /// This is selection-aware: it skips `offset` selected rows, then returns `length` selected rows.
+    /// Unlike a simple array slice, this respects the selection bitmap.
     pub fn slice(&self, offset: usize, length: usize) -> Self {
-        let batch = self.batch.slice(offset, length);
-        let selection_slice = &self.selection[offset..offset + length];
-        let mut new_selection = bitvec::prelude::BitVec::with_capacity(length);
+        // Find which array indices correspond to the offset and offset+length selected rows
+        let mut selected_count = 0;
+        let mut start_array_idx = 0;
+        let mut end_array_idx = self.selection.len();
+        
+        // Find the array index where we've skipped `offset` selected rows
+        for (i, selected) in self.selection.iter().enumerate() {
+            if *selected {
+                if selected_count == offset {
+                    start_array_idx = i;
+                    break;
+                }
+                selected_count += 1;
+            }
+        }
+        
+        // Find the array index where we've collected `offset + length` selected rows
+        let target = offset + length;
+        selected_count = 0;
+        for (i, selected) in self.selection.iter().enumerate() {
+            if *selected {
+                selected_count += 1;
+                if selected_count == target {
+                    end_array_idx = i + 1;
+                    break;
+                }
+            }
+        }
+        
+        trace!(
+            offset = offset,
+            length = length,
+            start_array_idx = start_array_idx,
+            end_array_idx = end_array_idx,
+            "ExecutionBatch::slice"
+        );
+        
+        // Slice the underlying batch and selection
+        let slice_length = end_array_idx - start_array_idx;
+        let batch = self.batch.slice(start_array_idx, slice_length);
+        let selection_slice = &self.selection[start_array_idx..end_array_idx];
+        let mut new_selection = bitvec::prelude::BitVec::with_capacity(slice_length);
         new_selection.extend_from_bitslice(selection_slice);
         let row_count = new_selection.count_ones();
+        
+        trace!(
+            new_selection_len = new_selection.len(),
+            row_count = row_count,
+            "ExecutionBatch::slice: result"
+        );
         
         Self {
             batch,

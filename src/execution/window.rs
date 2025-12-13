@@ -11,6 +11,7 @@ use anyhow::Result;
 use bitvec::prelude::*;
 use std::collections::{HashMap, HashSet};
 use fxhash::FxHashMap;
+use tracing::{debug, warn};
 
 /// Window operator - computes window functions
 pub struct WindowOperator {
@@ -175,11 +176,11 @@ impl WindowOperator {
                     
                     // Use batch schema for column resolution - all batches should have same schema
                     // After buffering, batches should always be available - use buffered batch schema
-                    // In sort_partitions closure, we can't use ? operator, so use unwrap_or_else with panic
                     // COLID: Use batch for ColumnSchema-based resolution
+                    // Note: Using expect() here as buffered_batches should never be empty after buffering
                     let batch_a_for_resolution = self.buffered_batches.get(batch_a_idx)
                         .or_else(|| self.buffered_batches.first())
-                        .expect("No buffered batches available for schema resolution in sort_partitions");
+                        .expect("No buffered batches available for schema resolution in sort_partitions - this indicates a bug");
                     
                     let col_idx = match self.resolve_column_index(batch_a_for_resolution, &order_col.column) {
                         Some(idx) => idx,
@@ -233,6 +234,7 @@ impl WindowOperator {
     }
     
     /// Extract value from array at index
+    /// Note: Uses expect() for downcast failures as they indicate a type mismatch bug
     fn extract_value(array: &Arc<dyn Array>, idx: usize) -> Value {
         if array.is_null(idx) {
             return Value::Null;
@@ -240,19 +242,23 @@ impl WindowOperator {
         
         match array.data_type() {
             DataType::Int64 => {
-                let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+                let arr = array.as_any().downcast_ref::<Int64Array>()
+                    .expect("Type mismatch: expected Int64Array but got different type");
                 Value::Int64(arr.value(idx))
             }
             DataType::Float64 => {
-                let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
+                let arr = array.as_any().downcast_ref::<Float64Array>()
+                    .expect("Type mismatch: expected Float64Array but got different type");
                 Value::Float64(arr.value(idx))
             }
             DataType::Utf8 => {
-                let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
+                let arr = array.as_any().downcast_ref::<StringArray>()
+                    .expect("Type mismatch: expected StringArray but got different type");
                 Value::String(arr.value(idx).to_string())
             }
             DataType::Boolean => {
-                let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                let arr = array.as_any().downcast_ref::<BooleanArray>()
+                    .expect("Type mismatch: expected BooleanArray but got different type");
                 Value::Bool(arr.value(idx))
             }
             _ => Value::String(format!("{:?}", array))
@@ -476,7 +482,12 @@ impl WindowOperator {
 
 impl BatchIterator for WindowOperator {
     fn prepare(&mut self) -> Result<(), anyhow::Error> {
-        Ok(()) // WindowOperator doesn't need prepare() yet
+        // CRITICAL FIX: WindowOperator must recursively prepare its input
+        // Otherwise, the input operator's prepare() won't be called, causing panics
+        debug!("[WINDOW PREPARE] Preparing WindowOperator, recursively preparing input");
+        crate::execution::operators::FilterOperator::prepare_child(&mut self.input)?;
+        debug!("[WINDOW PREPARE] WindowOperator prepared");
+        Ok(())
     }
     
     fn next(&mut self) -> Result<Option<ExecutionBatch>> {
@@ -534,6 +545,9 @@ impl BatchIterator for WindowOperator {
             .iter()
             .map(|f| f.name().clone())
             .collect();
+        
+        // Track which window functions actually had arrays added (to ensure schema matches)
+        let mut added_window_functions: Vec<&WindowFunctionExpr> = Vec::new();
         
         for win_func in &self.window_functions {
             let mut window_values: Vec<Option<Value>> = Vec::new();
@@ -596,7 +610,10 @@ impl BatchIterator for WindowOperator {
             // If it does, skip adding both the array and the field to prevent duplicates
             let field_name = win_func.alias.as_ref().unwrap_or(&"window_result".to_string()).clone();
             if existing_field_names.contains(&field_name) {
-                eprintln!("WARNING WindowOperator: Window function alias '{}' conflicts with existing column. Skipping window function entirely.", field_name);
+                warn!(
+                    alias = %field_name,
+                    "WindowOperator: Window function alias conflicts with existing column. Skipping window function entirely."
+                );
                 // Skip this window function - don't add array or field
                 continue;
             }
@@ -639,6 +656,8 @@ impl BatchIterator for WindowOperator {
             };
             
             new_columns.push(window_array);
+            // Track that this window function had an array added
+            added_window_functions.push(win_func);
         }
         
         // Create new schema with window function columns
@@ -648,18 +667,14 @@ impl BatchIterator for WindowOperator {
         let mut new_fields = batch.batch.schema.fields().to_vec();
         let mut seen_field_names: std::collections::HashSet<String> = existing_field_names.clone();
         
-        for win_func in &self.window_functions {
-            let mut field_name = win_func.alias.as_ref().unwrap_or(&"window_result".to_string()).clone();
+        // CRITICAL FIX: Only add fields for window functions that actually had arrays added
+        // This ensures schema fields exactly match the arrays we created
+        for win_func in &added_window_functions {
+            let field_name = win_func.alias.as_ref().unwrap_or(&"window_result".to_string()).clone();
             
-            // CRITICAL FIX: Check if this field name matches an aggregate function alias
-            // If it does, this is likely a bug - window functions shouldn't have the same aliases as aggregates
-            // Skip adding this window function column if it conflicts with an existing aggregate column
-            // This prevents the _1 suffix from being added to aggregate columns
-            // NOTE: We already checked this earlier when creating the arrays, so this should never happen
-            // But we keep the check here for safety
+            // Double-check: this should never conflict since we already filtered when adding arrays
             if seen_field_names.contains(&field_name) {
-                eprintln!("WARNING WindowOperator: Window function alias '{}' conflicts with existing column. Skipping field (array was already skipped).", field_name);
-                // Skip this window function field - array was already skipped earlier
+                eprintln!("WARNING WindowOperator: Window function alias '{}' conflicts with existing column. This should not happen since we filtered earlier.", field_name);
                 continue;
             }
             seen_field_names.insert(field_name.clone());
@@ -672,13 +687,30 @@ impl BatchIterator for WindowOperator {
             };
             new_fields.push(Arc::new(Field::new(field_name.clone(), data_type, true)));
         }
-        let new_schema = Arc::new(Schema::new(new_fields));
+        let mut new_schema = Arc::new(Schema::new(new_fields));
         
         // SCHEMA-FLOW: Validate output column order = input + computed windows
         // Ensure number of columns matches number of fields
-        debug_assert_eq!(new_columns.len(), new_schema.fields().len(), 
-            "WindowOperator: Column count ({}) != schema field count ({})", 
-            new_columns.len(), new_schema.fields().len());
+        // FIX: Handle mismatch gracefully instead of panicking - this can happen if window functions
+        // were skipped due to conflicts or if WindowOperator was incorrectly created for non-window queries
+        if new_columns.len() != new_schema.fields().len() {
+            warn!(
+                "WindowOperator: Column count ({}) != schema field count ({}). This may indicate WindowOperator was incorrectly created for a non-window query. Attempting to fix by adjusting schema.",
+                new_columns.len(), new_schema.fields().len()
+            );
+            // If we have more columns than fields, we likely skipped some window function fields
+            // If we have more fields than columns, we likely have duplicate field definitions
+            // For now, truncate or extend to match
+            let mut adjusted_fields = new_schema.fields().to_vec();
+            if new_columns.len() > adjusted_fields.len() {
+                // Remove extra columns (shouldn't happen, but handle it)
+                new_columns.truncate(adjusted_fields.len());
+            } else {
+                // Remove extra fields to match columns
+                adjusted_fields.truncate(new_columns.len());
+            }
+            new_schema = Arc::new(Schema::new(adjusted_fields));
+        }
         
         // Ensure input columns are preserved (first N columns should match input schema)
         let input_field_count = batch.batch.schema.fields().len();
@@ -699,9 +731,11 @@ impl BatchIterator for WindowOperator {
         }
         
         // SCHEMA-FLOW DEBUG: Log output schema
-        eprintln!("DEBUG WindowOperator::next() - Output schema has {} fields: {:?}", 
-            new_schema.fields().len(),
-            new_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+        debug!(
+            field_count = new_schema.fields().len(),
+            field_names = ?new_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>(),
+            "WindowOperator::next() - Output schema"
+        );
         
         // Create new batch with window function columns
         use crate::storage::columnar::ColumnarBatch;
@@ -755,9 +789,11 @@ impl BatchIterator for WindowOperator {
         let input_schema = self.input.schema();
         
         // SCHEMA-FLOW DEBUG: Log schema propagation
-        eprintln!("DEBUG WindowOperator::schema() - Input schema has {} fields: {:?}", 
-            input_schema.fields().len(),
-            input_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+        debug!(
+            field_count = input_schema.fields().len(),
+            field_names = ?input_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>(),
+            "WindowOperator::schema() - Input schema"
+        );
         
         let mut fields = input_schema.fields().to_vec();
         

@@ -11,7 +11,7 @@ use anyhow::Result;
 use std::arch::x86_64::*;
 
 // SIMD-optimized functions - inline implementation
-mod simd_ops {
+pub mod simd_ops {
     
     pub fn cosine_similarity_simd(a: &[f32], b: &[f32]) -> f32 {
         #[cfg(target_arch = "x86_64")]

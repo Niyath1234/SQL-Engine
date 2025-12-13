@@ -129,31 +129,31 @@ mod tests {
     
     #[test]
     fn test_operator_cache_put_get() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let mut cache = OperatorCache::new(temp_dir.path().to_path_buf(), 1000);
         
         let key = "test_operator";
         let bytes = b"compiled_wasm_module";
         
         // Put entry
-        let path = cache.put(key, bytes).unwrap();
+        let path = cache.put(key, bytes).expect("Failed to put cache entry");
         assert!(path.exists(), "Cache file should exist");
         
         // Get entry
         let cached_path = cache.get(key);
         assert!(cached_path.is_some(), "Should retrieve cached entry");
-        assert_eq!(cached_path.unwrap(), path, "Should return same path");
+        assert_eq!(cached_path.expect("Should have cached path"), path, "Should return same path");
     }
     
     #[test]
     fn test_operator_cache_eviction() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let mut cache = OperatorCache::new(temp_dir.path().to_path_buf(), 100);
         
         // Add entries that exceed max_bytes
-        cache.put("op1", &vec![0u8; 50]).unwrap();
-        cache.put("op2", &vec![0u8; 50]).unwrap();
-        cache.put("op3", &vec![0u8; 50]).unwrap(); // Should evict op1
+        cache.put("op1", &vec![0u8; 50]).expect("Failed to put op1");
+        cache.put("op2", &vec![0u8; 50]).expect("Failed to put op2");
+        cache.put("op3", &vec![0u8; 50]).expect("Failed to put op3"); // Should evict op1
         
         // op1 should be evicted
         assert!(cache.get("op1").is_none(), "op1 should be evicted");
@@ -163,18 +163,18 @@ mod tests {
     
     #[test]
     fn test_operator_cache_lru() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let mut cache = OperatorCache::new(temp_dir.path().to_path_buf(), 100);
         
-        cache.put("op1", &vec![0u8; 30]).unwrap();
-        cache.put("op2", &vec![0u8; 30]).unwrap();
-        cache.put("op3", &vec![0u8; 30]).unwrap();
+        cache.put("op1", &vec![0u8; 30]).expect("Failed to put op1");
+        cache.put("op2", &vec![0u8; 30]).expect("Failed to put op2");
+        cache.put("op3", &vec![0u8; 30]).expect("Failed to put op3");
         
         // Access op1 to bump it to end of LRU
         cache.get("op1");
         
         // Add op4, should evict op2 (least recently used)
-        cache.put("op4", &vec![0u8; 30]).unwrap();
+        cache.put("op4", &vec![0u8; 30]).expect("Failed to put op4");
         
         assert!(cache.get("op1").is_some(), "op1 should still be cached (was accessed)");
         assert!(cache.get("op2").is_none(), "op2 should be evicted (least recently used)");

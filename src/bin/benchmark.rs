@@ -127,6 +127,8 @@ fn create_large_dataset(engine: &mut HypergraphSQLEngine, size: usize) -> Result
             memory_size: size * 8,
             table_name: None,
             column_name: None,
+            metadata: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
         },
     );
     
@@ -141,6 +143,7 @@ fn create_large_dataset(engine: &mut HypergraphSQLEngine, size: usize) -> Result
             memory_size: size * 20,
             table_name: None,
             column_name: None,
+            metadata: std::collections::HashMap::new(),
         },
     );
     
@@ -155,6 +158,8 @@ fn create_large_dataset(engine: &mut HypergraphSQLEngine, size: usize) -> Result
             memory_size: size * 8,
             table_name: None,
             column_name: None,
+            metadata: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
         },
     );
     
@@ -169,6 +174,7 @@ fn create_large_dataset(engine: &mut HypergraphSQLEngine, size: usize) -> Result
             memory_size: size * 15,
             table_name: None,
             column_name: None,
+            metadata: std::collections::HashMap::new(),
         },
     );
     
@@ -183,6 +189,8 @@ fn create_large_dataset(engine: &mut HypergraphSQLEngine, size: usize) -> Result
             memory_size: size * 8,
             table_name: None,
             column_name: None,
+            metadata: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
         },
     );
     
@@ -291,6 +299,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     memory_size: 40,
                     table_name: None,
                     column_name: None,
+            metadata: std::collections::HashMap::new(),
                 },
             );
             
@@ -305,6 +314,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     memory_size: 100,
                     table_name: None,
                     column_name: None,
+            metadata: std::collections::HashMap::new(),
                 },
             );
             

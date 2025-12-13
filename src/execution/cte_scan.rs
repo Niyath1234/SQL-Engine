@@ -3,6 +3,7 @@ use crate::execution::batch::{ExecutionBatch, BatchIterator};
 use anyhow::Result;
 use arrow::datatypes::*;
 use std::sync::Arc;
+use tracing::debug;
 
 /// CTE Scan operator - scans cached CTE results stored as ExecutionBatch vectors
 pub struct CTEScanOperator {
@@ -136,9 +137,11 @@ impl BatchIterator for CTEScanOperator {
             let schema = first_batch.batch.schema.clone();
             
             // SCHEMA-FLOW DEBUG: Log schema from CTE
-            eprintln!("DEBUG CTEScanOperator::schema() - CTE schema has {} fields: {:?}", 
-                schema.fields().len(),
-                schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+            debug!(
+                field_count = schema.fields().len(),
+                field_names = ?schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>(),
+                "CTEScanOperator::schema() - CTE schema"
+            );
             
             schema
         } else {

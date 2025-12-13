@@ -8,6 +8,7 @@ use crate::query::planner::QueryPlanner;
 use crate::hypergraph::graph::HyperGraph;
 use anyhow::Result;
 use std::sync::Arc;
+use tracing::debug;
 
 /// Default implementation of SubqueryExecutor using ExecutionEngine
 pub struct DefaultSubqueryExecutor {
@@ -48,9 +49,11 @@ impl DefaultSubqueryExecutor {
         
         // Extract table aliases from subquery to identify which columns are from outer context
         let subquery_tables = self.extract_subquery_tables(subquery);
-        eprintln!("DEBUG rewrite_subquery: subquery_tables={:?}, outer_batch schema fields: {:?}", 
-            subquery_tables, 
-            outer_batch.batch.schema.fields().iter().map(|f| f.name().to_string()).collect::<Vec<_>>());
+        debug!(
+            subquery_tables = ?subquery_tables,
+            schema_fields = ?outer_batch.batch.schema.fields().iter().map(|f| f.name().to_string()).collect::<Vec<_>>(),
+            "rewrite_subquery: subquery tables and outer batch schema"
+        );
         
         // Clone the subquery and rewrite it
         let mut rewritten = subquery.clone();
@@ -65,9 +68,13 @@ impl DefaultSubqueryExecutor {
                     &subquery_tables,
                 )?;
                 let rewritten_where = format!("{:?}", where_clause);
-                eprintln!("DEBUG rewrite_subquery: WHERE clause rewritten: {} -> {}", original_where, rewritten_where);
+                debug!(
+                    original_where = %original_where,
+                    rewritten_where = %rewritten_where,
+                    "rewrite_subquery: WHERE clause rewritten"
+                );
             } else {
-                eprintln!("DEBUG rewrite_subquery: No WHERE clause in subquery");
+                debug!("rewrite_subquery: No WHERE clause in subquery");
             }
         }
         
@@ -125,13 +132,20 @@ impl DefaultSubqueryExecutor {
                     let table_alias = &idents[0].value;
                     let column_name = &idents[1].value;
                     
-                    eprintln!("DEBUG rewrite_expr: Checking CompoundIdentifier: {}.{} (subquery_tables: {:?})", 
-                        table_alias, column_name, subquery_tables);
+                    debug!(
+                        table_alias = %table_alias,
+                        column_name = %column_name,
+                        subquery_tables = ?subquery_tables,
+                        "rewrite_expr: Checking CompoundIdentifier"
+                    );
                     
                     // If table alias is not in subquery tables, it's from outer context
                     if !subquery_tables.contains(table_alias) {
-                        eprintln!("DEBUG rewrite_expr: {}.{} is from outer context, resolving from outer batch", 
-                            table_alias, column_name);
+                        debug!(
+                            table_alias = %table_alias,
+                            column_name = %column_name,
+                            "rewrite_expr: Column is from outer context, resolving from outer batch"
+                        );
                         
                         // Resolve column from outer batch
                         let column_value = self.resolve_column_from_outer_context(
@@ -140,7 +154,12 @@ impl DefaultSubqueryExecutor {
                             column_name,
                         )?;
                         
-                        eprintln!("DEBUG rewrite_expr: Resolved {}.{} = {:?}", table_alias, column_name, column_value);
+                        debug!(
+                            table_alias = %table_alias,
+                            column_name = %column_name,
+                            column_value = ?column_value,
+                            "rewrite_expr: Resolved column value"
+                        );
                         
                         // Convert Value to sqlparser::ast::Value
                         use sqlparser::ast::Value as SqlValue;
@@ -171,12 +190,18 @@ impl DefaultSubqueryExecutor {
                             }
                         };
                         
-                        eprintln!("DEBUG rewrite_expr: Converted to SqlValue: {:?}", literal_value);
+                        debug!(
+                            literal_value = ?literal_value,
+                            "rewrite_expr: Converted to SqlValue"
+                        );
                         
                         return Ok(Expr::Value(literal_value));
                     } else {
-                        eprintln!("DEBUG rewrite_expr: {}.{} is from subquery tables, keeping as is", 
-                            table_alias, column_name);
+                        debug!(
+                            table_alias = %table_alias,
+                            column_name = %column_name,
+                            "rewrite_expr: Column is from subquery tables, keeping as is"
+                        );
                     }
                 }
                 Ok(expr.clone())
@@ -288,7 +313,10 @@ impl SubqueryExecutor for DefaultSubqueryExecutor {
             // Create new planner (planner is not Clone)
             QueryPlanner::from_arc_with_options(self.graph.clone(), false),
         ));
-        eprintln!("DEBUG subquery executor: Executing subquery with outer_context.is_some()={}", outer_context.is_some());
+        debug!(
+            has_outer_context = outer_context.is_some(),
+            "subquery executor: Executing subquery"
+        );
         let result = engine.execute_with_subquery_executor(
             &subquery_plan,
             None, // max_time_ms
@@ -297,18 +325,26 @@ impl SubqueryExecutor for DefaultSubqueryExecutor {
             Some(executor.clone() as Arc<dyn crate::query::expression::SubqueryExecutor>),
         )?;
         
-        eprintln!("DEBUG subquery executor: Subquery executed, row_count={}, batches.len()={}", result.row_count, result.batches.len());
+        debug!(
+            row_count = result.row_count,
+            batches_len = result.batches.len(),
+            "subquery executor: Subquery executed"
+        );
         
         // Extract first row, first column value
         if result.row_count == 0 {
-            eprintln!("DEBUG subquery executor: Subquery returned 0 rows");
+            debug!("subquery executor: Subquery returned 0 rows");
             return Ok(None);  // Subquery returned no rows
         }
         
         // Get first batch, first row, first column
         if let Some(first_batch) = result.batches.first() {
-            eprintln!("DEBUG subquery executor: First batch has {} rows, {} columns", first_batch.row_count, first_batch.batch.columns.len());
-            eprintln!("DEBUG subquery executor: Schema fields: {:?}", first_batch.batch.schema.fields().iter().map(|f| f.name().to_string()).collect::<Vec<_>>());
+            debug!(
+                row_count = first_batch.row_count,
+                column_count = first_batch.batch.columns.len(),
+                schema_fields = ?first_batch.batch.schema.fields().iter().map(|f| f.name().to_string()).collect::<Vec<_>>(),
+                "subquery executor: First batch info"
+            );
             if first_batch.row_count > 0 {
                 // Find first selected row (or first row if no selection bitmap)
                 let mut found_row = false;
@@ -322,46 +358,82 @@ impl SubqueryExecutor for DefaultSubqueryExecutor {
                     
                     if is_selected {
                         found_row = true;
-                        eprintln!("DEBUG subquery executor: Processing row {} (selected={}, row_count={})", row_idx, is_selected, first_batch.row_count);
+                        debug!(
+                            row_idx = row_idx,
+                            is_selected = is_selected,
+                            row_count = first_batch.row_count,
+                            "subquery executor: Processing row"
+                        );
                         // Try each column until we find a non-null value (aggregate results might not be in column 0)
                         for col_idx in 0..first_batch.batch.columns.len() {
                             if let Some(col) = first_batch.batch.column(col_idx) {
                                 let column_name = first_batch.batch.schema.field(col_idx).name();
                                 // Skip "window_result" or other non-aggregate columns
                                 if column_name == "window_result" || column_name.starts_with("_") {
-                                    eprintln!("DEBUG subquery executor: Skipping column {} ({})", col_idx, column_name);
+                                    debug!(
+                                        col_idx = col_idx,
+                                        column_name = %column_name,
+                                        "subquery executor: Skipping column"
+                                    );
                                     continue;
                                 }
                                 // Check if the array actually has data
-                                eprintln!("DEBUG subquery executor: Column {} ({}): array.len()={}, row_idx={}, is_null={}", 
-                                    col_idx, column_name, col.len(), row_idx, col.is_null(row_idx));
+                                debug!(
+                                    col_idx = col_idx,
+                                    column_name = %column_name,
+                                    array_len = col.len(),
+                                    row_idx = row_idx,
+                                    is_null = col.is_null(row_idx),
+                                    "subquery executor: Column info"
+                                );
                                 
                                 // If array has valid data, try to extract value
                                 if row_idx < col.len() && !col.is_null(row_idx) {
                                     let value = extract_value_from_array(col, row_idx)?;
-                                    eprintln!("DEBUG subquery executor: Column {} ({}): extracted value={:?}", col_idx, column_name, value);
+                                    debug!(
+                                        col_idx = col_idx,
+                                        column_name = %column_name,
+                                        value = ?value,
+                                        "subquery executor: Extracted value"
+                                    );
                                     if !matches!(value, Value::Null) {
-                                        eprintln!("DEBUG subquery executor: Using non-null value from column {}: {:?}", col_idx, value);
+                                        debug!(
+                                            col_idx = col_idx,
+                                            value = ?value,
+                                            "subquery executor: Using non-null value"
+                                        );
                                         return Ok(Some(value));
                                     }
                                 } else {
-                                    eprintln!("DEBUG subquery executor: Column {} ({}) is NULL or out of bounds (row_idx={}, array.len()={})", 
-                                        col_idx, column_name, row_idx, col.len());
+                                    debug!(
+                                        col_idx = col_idx,
+                                        column_name = %column_name,
+                                        row_idx = row_idx,
+                                        array_len = col.len(),
+                                        "subquery executor: Column is NULL or out of bounds"
+                                    );
                                 }
                             }
                         }
                         // If all columns were NULL but we have a row, return NULL
-                        eprintln!("DEBUG subquery executor: All columns are NULL for row {}", row_idx);
+                        debug!(
+                            row_idx = row_idx,
+                            "subquery executor: All columns are NULL for row"
+                        );
                         return Ok(Some(Value::Null));
                     }
                 }
                 if !found_row {
-                    eprintln!("DEBUG subquery executor: No selected rows found in batch (row_count={}, selection.len()={})", first_batch.row_count, first_batch.selection.len());
+                    debug!(
+                        row_count = first_batch.row_count,
+                        selection_len = first_batch.selection.len(),
+                        "subquery executor: No selected rows found in batch"
+                    );
                 }
             }
         }
         
-        eprintln!("DEBUG subquery executor: Returning None (fallback)");
+        debug!("subquery executor: Returning None (fallback)");
         Ok(None)
     }
     

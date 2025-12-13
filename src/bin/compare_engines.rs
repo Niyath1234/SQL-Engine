@@ -585,6 +585,7 @@ fn load_csv(path: &str) -> Result<(usize, Vec<String>, Vec<(String, ColumnFragme
                 memory_size: 0,
                 table_name: None,
                 column_name: None,
+                metadata: std::collections::HashMap::new(),
             },
         );
         column_fragments.push((col_name.clone(), fragment));

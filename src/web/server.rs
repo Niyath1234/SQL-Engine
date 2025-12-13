@@ -10,6 +10,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
+use tower_http::services::ServeDir;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,20 +21,44 @@ pub type AppState = Arc<RwLock<HypergraphSQLEngine>>;
 pub async fn start_server(engine: HypergraphSQLEngine, port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let state: AppState = Arc::new(RwLock::new(engine));
     
-    let app = Router::new()
-        .route("/", get(index))
-        .route("/api/execute", post(execute_query))
-        .route("/api/llm/execute", post(execute_llm_query))
-        .route("/api/tables", get(list_tables))
-        .route("/api/table/:name", get(get_table_info))
-        .route("/api/relationships", get(get_relationships))
-        .route("/api/stats", get(get_stats))
-        .route("/api/load_csv", post(load_csv))
-        .route("/api/clear_cache", post(clear_cache))
-        .route("/api/schema", get(get_schema))
-        .route("/api/saved", get(list_saved_queries).post(create_saved_query))
-        .route("/api/saved/:id", put(update_saved_query).delete(delete_saved_query))
-        .route("/api/health", get(health_check))
+    // Build all API routes first (they take precedence over static files)
+    let api_routes = Router::new()
+        .route("/execute", post(execute_query))
+        .route("/llm/execute", post(execute_llm_query))
+        .route("/tables", get(list_tables))
+        .route("/table/:name", get(get_table_info))
+        .route("/relationships", get(get_relationships))
+        .route("/stats", get(get_stats))
+        .route("/load_csv", post(load_csv))
+        .route("/clear_cache", post(clear_cache))
+        .route("/clear_all", post(clear_all_data))
+        .route("/schema", get(get_schema))
+        .route("/schema/sync", post(schema_sync))
+        .route("/saved", get(list_saved_queries).post(create_saved_query))
+        .route("/saved/:id", put(update_saved_query).delete(delete_saved_query))
+        .route("/health", get(health_check))
+        // Phase 2: Ingestion API endpoints
+        .route("/ingest/simulate", post(ingest_simulate))
+        .route("/ingest/load_sample_data", post(load_sample_data))
+        // Phase 5: LLM Cortex API endpoints
+        .route("/ask", post(ask_llm))
+        .with_state(state.clone());
+    
+    // Try to serve static files from static/ directory (if built)
+    let static_dir = std::path::Path::new("static");
+    let app = if static_dir.exists() && static_dir.is_dir() {
+        // Production mode: serve built static files, with API routes taking precedence
+        Router::new()
+            .nest("/api", api_routes)
+            .nest_service("/", ServeDir::new("static"))
+    } else {
+        // Development mode: serve basic HTML (Vite dev server should be running on port 3000)
+        Router::new()
+            .nest("/api", api_routes)
+            .route("/", get(index))
+    };
+    
+    let app = app
         .layer(CorsLayer::permissive())
         .with_state(state);
     
@@ -482,6 +507,93 @@ async fn clear_cache(_state: State<AppState>) -> Result<Json<ClearCacheResponse>
     }
 }
 
+#[derive(Serialize)]
+struct ClearAllResponse {
+    success: bool,
+    message: String,
+    tables_dropped: Vec<String>,
+    cleared_items: Vec<String>,
+    error: Option<String>,
+}
+
+async fn clear_all_data(State(state): State<AppState>) -> Result<Json<ClearAllResponse>, StatusCode> {
+    use std::fs;
+    use std::path::Path;
+    
+    let mut engine = state.write().await;
+    let mut tables_dropped = Vec::new();
+    let mut cleared_items = Vec::new();
+    let mut errors = Vec::new();
+    
+    // Get all table names first
+    let table_names: Vec<String> = {
+        let graph = engine.graph();
+        let mut names = Vec::new();
+        for (_, node) in graph.iter_nodes() {
+            if matches!(node.node_type, crate::hypergraph::node::NodeType::Table) {
+                if let Some(table_name) = &node.table_name {
+                    names.push(table_name.clone());
+                }
+            }
+        }
+        names
+    };
+    
+    // Drop all tables
+    for table_name in &table_names {
+        match engine.execute_query(&format!("DROP TABLE IF EXISTS {}", table_name)) {
+            Ok(_) => {
+                tables_dropped.push(table_name.clone());
+            }
+            Err(e) => {
+                errors.push(format!("Failed to drop table {}: {}", table_name, e));
+            }
+        }
+    }
+    
+    // Clear all caches
+    engine.clear_all_caches();
+    cleared_items.push("result_cache".to_string());
+    cleared_items.push("plan_cache".to_string());
+    
+    // Clear cache directories
+    let cache_dirs = [".operator_cache", ".spill", ".query_patterns", ".wal"];
+    for dir in &cache_dirs {
+        let path = Path::new(dir);
+        if path.exists() {
+            match fs::remove_dir_all(path) {
+                Ok(_) => cleared_items.push(format!("{}/", dir)),
+                Err(e) => errors.push(format!("Failed to remove {}: {}", dir, e)),
+            }
+        }
+    }
+    
+    // Clear WorldState (reset to empty)
+    {
+        let mut world_state = engine.world_state_mut();
+        *world_state = crate::worldstate::WorldState::new();
+    }
+    
+    if errors.is_empty() {
+        Ok(Json(ClearAllResponse {
+            success: true,
+            message: format!("Successfully cleared all data: {} tables dropped, {} cache items cleared", 
+                tables_dropped.len(), cleared_items.len()),
+            tables_dropped,
+            cleared_items,
+            error: None,
+        }))
+    } else {
+        Ok(Json(ClearAllResponse {
+            success: false,
+            message: format!("Partially cleared. {} error(s) occurred", errors.len()),
+            tables_dropped,
+            cleared_items,
+            error: Some(errors.join("; ")),
+        }))
+    }
+}
+
 // New endpoints for Querybook UI
 
 #[derive(Serialize)]
@@ -627,4 +739,383 @@ async fn delete_saved_query(Path(id): Path<String>) -> Result<StatusCode, Status
 
 async fn health_check() -> Result<Json<serde_json::Value>, StatusCode> {
     Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+#[derive(Deserialize)]
+struct SimulateIngestionRequest {
+    source_id: Option<String>,
+    table_name: Option<String>,
+    schema_type: Option<String>,
+    batch_size: Option<usize>,
+    #[serde(default)]
+    payloads: Option<Vec<serde_json::Value>>,
+}
+
+async fn ingest_simulate(
+    State(state): State<AppState>,
+    Json(req): Json<SimulateIngestionRequest>,
+) -> Result<Json<crate::ingestion::IngestionResult>, StatusCode> {
+    let mut engine = state.write().await;
+    let source_id = req.source_id.unwrap_or_else(|| "simulator_1".to_string());
+    
+    let result = if let Some(payloads) = req.payloads {
+        let connector = crate::ingestion::JsonConnector::new(source_id.clone(), payloads);
+        engine.ingest(Box::new(connector), req.table_name)
+    } else {
+        let schema_type = match req.schema_type.as_deref().unwrap_or("flat") {
+            "nested" => crate::ingestion::SimulatorSchema::Nested,
+            "with_arrays" => crate::ingestion::SimulatorSchema::WithArrays,
+            "ecommerce" => crate::ingestion::SimulatorSchema::ECommerce,
+            _ => crate::ingestion::SimulatorSchema::Flat,
+        };
+        let connector = crate::ingestion::SimulatorConnector::new(source_id.clone(), schema_type)
+            .with_batch_size(req.batch_size.unwrap_or(100));
+        engine.ingest(Box::new(connector), req.table_name)
+    };
+    
+    match result {
+        Ok(ingestion_result) => {
+            // Auto-sync schema after successful ingestion to keep WorldState in sync
+            let tables: Vec<String> = engine.graph().iter_nodes()
+                .filter_map(|(_, node)| {
+                    if matches!(node.node_type, crate::hypergraph::node::NodeType::Table) {
+                        node.table_name.clone()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let _ = engine.sync_worldstate_schema_from_hypergraph();
+            Ok(Json(ingestion_result))
+        }
+        Err(e) => {
+            eprintln!("Ingestion failed: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn load_sample_data(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use serde_json::json;
+    let mut engine = state.write().await;
+    
+    let sample_tables = vec![
+        ("products", "products_api", json!([
+            {"id": 1, "name": "Laptop Pro", "price": 1299.99, "category_id": 1, "created_at": "2024-01-15"},
+            {"id": 2, "name": "Wireless Mouse", "price": 29.99, "category_id": 1, "created_at": "2024-01-16"},
+            {"id": 3, "name": "Mechanical Keyboard", "price": 149.99, "category_id": 1, "created_at": "2024-01-17"},
+            {"id": 4, "name": "Office Chair", "price": 299.99, "category_id": 2, "created_at": "2024-01-18"},
+            {"id": 5, "name": "Standing Desk", "price": 599.99, "category_id": 2, "created_at": "2024-01-19"},
+            {"id": 6, "name": "Monitor 27\"", "price": 399.99, "category_id": 1, "created_at": "2024-01-20"},
+            {"id": 7, "name": "USB-C Hub", "price": 79.99, "category_id": 1, "created_at": "2024-01-21"},
+            {"id": 8, "name": "Desk Lamp", "price": 49.99, "category_id": 2, "created_at": "2024-01-22"},
+            {"id": 9, "name": "Webcam HD", "price": 89.99, "category_id": 1, "created_at": "2024-01-23"},
+            {"id": 10, "name": "Noise Cancelling Headphones", "price": 249.99, "category_id": 1, "created_at": "2024-01-24"},
+        ])),
+        ("categories", "categories_api", json!([
+            {"id": 1, "name": "Electronics", "description": "Electronic devices and accessories"},
+            {"id": 2, "name": "Furniture", "description": "Office and home furniture"},
+            {"id": 3, "name": "Software", "description": "Software licenses and subscriptions"},
+        ])),
+        ("customers", "customers_api", json!([
+            {"id": 1, "name": "John Doe", "email": "john@example.com", "created_at": "2024-01-10"},
+            {"id": 2, "name": "Jane Smith", "email": "jane@example.com", "created_at": "2024-01-11"},
+            {"id": 3, "name": "Bob Johnson", "email": "bob@example.com", "created_at": "2024-01-12"},
+            {"id": 4, "name": "Alice Williams", "email": "alice@example.com", "created_at": "2024-01-13"},
+            {"id": 5, "name": "Charlie Brown", "email": "charlie@example.com", "created_at": "2024-01-14"},
+        ])),
+        ("orders", "orders_api", json!([
+            {"id": 1, "customer_id": 1, "order_date": "2024-01-20", "status": "completed", "total_amount": 1329.98},
+            {"id": 2, "customer_id": 2, "order_date": "2024-01-21", "status": "pending", "total_amount": 449.98},
+            {"id": 3, "customer_id": 3, "order_date": "2024-01-22", "status": "completed", "total_amount": 899.98},
+            {"id": 4, "customer_id": 1, "order_date": "2024-01-23", "status": "completed", "total_amount": 79.99},
+            {"id": 5, "customer_id": 4, "order_date": "2024-01-24", "status": "pending", "total_amount": 249.99},
+            {"id": 6, "customer_id": 2, "order_date": "2024-01-25", "status": "completed", "total_amount": 1299.99},
+            {"id": 7, "customer_id": 5, "order_date": "2024-01-26", "status": "completed", "total_amount": 599.99},
+        ])),
+        ("order_items", "order_items_api", json!([
+            {"order_id": 1, "product_id": 1, "quantity": 1, "price": 1299.99},
+            {"order_id": 1, "product_id": 2, "quantity": 1, "price": 29.99},
+            {"order_id": 2, "product_id": 3, "quantity": 1, "price": 149.99},
+            {"order_id": 2, "product_id": 6, "quantity": 1, "price": 399.99},
+            {"order_id": 3, "product_id": 4, "quantity": 1, "price": 299.99},
+            {"order_id": 3, "product_id": 5, "quantity": 1, "price": 599.99},
+            {"order_id": 4, "product_id": 7, "quantity": 1, "price": 79.99},
+            {"order_id": 5, "product_id": 10, "quantity": 1, "price": 249.99},
+            {"order_id": 6, "product_id": 1, "quantity": 1, "price": 1299.99},
+            {"order_id": 7, "product_id": 5, "quantity": 1, "price": 599.99},
+        ])),
+    ];
+    
+    let mut results = Vec::new();
+    for (table_name, source_id, payloads) in sample_tables {
+        let payloads_vec: Vec<serde_json::Value> = serde_json::from_value(payloads)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let connector = crate::ingestion::JsonConnector::new(source_id.to_string(), payloads_vec);
+        match engine.ingest(Box::new(connector), Some(table_name.to_string())) {
+            Ok(result) => {
+                // Auto-sync schema after each table ingestion
+                let tables: Vec<String> = engine.graph().iter_nodes()
+                    .filter_map(|(_, node)| {
+                        if matches!(node.node_type, crate::hypergraph::node::NodeType::Table) {
+                            node.table_name.clone()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let _ = engine.sync_worldstate_schema_from_hypergraph();
+                results.push(serde_json::json!({
+                    "table": table_name,
+                    "status": "success",
+                    "records": result.records_ingested,
+                }));
+            }
+            Err(e) => {
+                eprintln!("Failed to ingest {}: {}", table_name, e);
+                results.push(serde_json::json!({
+                    "table": table_name,
+                    "status": "error",
+                    "error": e.to_string(),
+                }));
+            }
+        }
+    }
+    
+    // Final schema sync after all tables are loaded
+    let _ = engine.sync_worldstate_schema_from_hypergraph();
+    
+    let join_rules = vec![
+        ("products", "category_id", "categories", "id"),
+        ("orders", "customer_id", "customers", "id"),
+        ("order_items", "order_id", "orders", "id"),
+        ("order_items", "product_id", "products", "id"),
+    ];
+    
+    let join_rules_count = join_rules.len();
+    for (left_table, left_key, right_table, right_key) in join_rules {
+        if let Ok(rule_id) = engine.create_join_rule(
+            left_table.to_string(),
+            vec![left_key.to_string()],
+            right_table.to_string(),
+            vec![right_key.to_string()],
+            "inner".to_string(),
+            format!("{} joins to {}", left_table, right_table),
+        ) {
+            let _ = engine.approve_join_rule(&rule_id);
+        }
+    }
+    
+    let _ = engine.sync_all_approved_rules_to_hypergraph();
+    
+    Ok(Json(serde_json::json!({
+        "status": "success",
+        "tables_loaded": results,
+        "join_rules_created": join_rules_count,
+    })))
+}
+
+#[derive(Deserialize)]
+struct AskRequest {
+    intent: String,
+    user_id: Option<String>,
+    ollama_url: Option<String>,
+    model: Option<String>,
+}
+
+async fn ask_llm(
+    State(state): State<AppState>,
+    Json(req): Json<AskRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut engine = state.write().await;
+    // Build metadata pack using hypergraph execution schema (single source of truth for columns/types)
+    let metadata_pack = engine.export_metadata_pack_execution_truth(req.user_id.as_deref());
+
+    // Hard schema sync gate: block LLM queries if WorldState schema != hypergraph schema.
+    let tables_for_gate: Vec<String> = metadata_pack.tables.iter().map(|t| t.name.clone()).collect();
+    // Compare execution-equivalent hashes (columns/types only) to avoid false mismatches
+    let world_exec_schema_hash = engine.worldstate_execution_schema_hash(&tables_for_gate);
+    let hyper_exec_schema_hash = engine.hypergraph_schema_hash(&tables_for_gate);
+    if world_exec_schema_hash != hyper_exec_schema_hash {
+        return Ok(Json(serde_json::json!({
+            "status": "schema_out_of_sync",
+            "reason": "WorldState schema does not match hypergraph execution schema. Run /api/schema/sync to repair.",
+            "tables_checked": tables_for_gate,
+            "worldstate_execution_schema_hash": world_exec_schema_hash,
+            "hypergraph_execution_schema_hash": hyper_exec_schema_hash,
+            "suggestions": [
+                "Call POST /api/schema/sync to rebuild WorldState schema registry from hypergraph execution schema",
+                "If this keeps happening, ensure ingestion writes schema into both hypergraph and WorldState consistently"
+            ]
+        })));
+    }
+    let policy = {
+        let world_state = engine.world_state();
+        world_state.policy_registry.get_query_policy(req.user_id.as_deref()).clone()
+    };
+    
+    // NEW PIPELINE: LLM → IntentSpec → Compiler → StructuredPlan
+    let intent_spec_generator = crate::llm::IntentSpecGenerator::new(
+        req.ollama_url.clone(),
+        req.model.clone(),
+    );
+    
+    let intent_spec = match intent_spec_generator.generate_intent_spec(&req.intent, &metadata_pack).await {
+        Ok(spec) => spec,
+        Err(e) => {
+            eprintln!("IntentSpec generation failed: {}", e);
+            return Ok(Json(serde_json::json!({
+                "status": "intent_spec_generation_failed",
+                "reason": e.to_string(),
+                "suggestions": ["LLM failed to generate IntentSpec - check Ollama connection"]
+            })));
+        }
+    };
+    
+    // Validate IntentSpec doesn't contain schema references (strict mode)
+    let schema_errors = intent_spec.validate_no_schema_references();
+    if !schema_errors.is_empty() {
+        return Ok(Json(serde_json::json!({
+            "status": "intent_spec_validation_failed",
+            "reason": "IntentSpec contains schema references (table/column names)",
+            "errors": schema_errors,
+            "suggestions": ["LLM should output generic entities, not table/column names"]
+        })));
+    }
+    
+    // Compile IntentSpec → StructuredPlan (deterministic, hypergraph-aware)
+    let mut compiler = crate::llm::IntentCompiler::with_llm_scoring(
+        req.intent.clone(),
+        req.ollama_url.clone(),
+        req.model.clone(),
+    );
+    let mut structured_plan = match compiler.compile(&intent_spec, &metadata_pack).await {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("Intent compilation failed: {}", e);
+            return Ok(Json(serde_json::json!({
+                "status": "compilation_failed",
+                "reason": e.to_string(),
+                "intent_spec": intent_spec,
+                "suggestions": ["Compiler could not resolve IntentSpec to tables/columns - check hypergraph"]
+            })));
+        }
+    };
+    
+    let compiler_explanations = compiler.get_explanations().iter()
+        .map(|e| serde_json::json!({
+            "step": e.step,
+            "decision": e.decision,
+            "reason": e.reason
+        }))
+        .collect::<Vec<_>>();
+    
+    let validator = crate::llm::PlanValidator::new();
+    let sql_generator = crate::llm::SQLGenerator::new();
+    let audit_log = crate::llm::AuditLog::default();
+
+    // Skip normalization for now - compiler should produce correct plans
+    // TODO: Re-enable normalization after fixing issues
+    /*
+    let normalizer = crate::llm::PlanNormalizer::new();
+    if let Err(e) = normalizer.normalize(&mut structured_plan, &metadata_pack) {
+        eprintln!("WARNING: Normalization failed after compilation: {}", e);
+        // For MVP: continue anyway (compiler should have produced correct plan)
+    }
+    */
+    match validator.validate(&structured_plan, &metadata_pack, &policy) {
+        crate::llm::ValidationResult::Valid => {}
+        crate::llm::ValidationResult::Invalid { reason, suggestions } => {
+            return Ok(Json(serde_json::json!({
+                "status": "validation_failed",
+                "reason": reason,
+                "suggestions": suggestions,
+                "structured_plan": structured_plan,
+            })));
+        }
+    }
+    let sql = sql_generator.generate_sql(&structured_plan, &policy);
+    let world_hash = {
+        let world_state = engine.world_state();
+        world_state.world_hash_global()
+    };
+    let query_hash = {
+        use crate::query::cache::QuerySignature;
+        QuerySignature::from_sql(&sql).hash()
+    };
+    let entry_id = audit_log.log(
+        req.intent.clone(),
+        structured_plan.clone(),
+        sql.clone(),
+        world_hash,
+        query_hash,
+    );
+    let execution_result = engine.execute_query(&sql);
+    match execution_result {
+        Ok(result) => {
+            audit_log.update_execution_stats(
+                &entry_id,
+                result.row_count as u64,
+                result.execution_time_ms,
+                false,
+            );
+            Ok(Json(serde_json::json!({
+                "status": "success",
+                "entry_id": entry_id,
+                "structured_plan": structured_plan,
+                "sql": sql,
+                "result": {
+                    "row_count": result.row_count,
+                    "execution_time_ms": result.execution_time_ms,
+                },
+            })))
+        }
+        Err(e) => {
+            Ok(Json(serde_json::json!({
+                "status": "execution_failed",
+                "error": e.to_string(),
+                "sql": sql,
+            })))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SchemaSyncRequest {
+    // Reserved for future: direction/mode. For now we only support worldstate_from_hypergraph.
+    mode: Option<String>,
+}
+
+async fn schema_sync(
+    State(state): State<AppState>,
+    Json(req): Json<Option<SchemaSyncRequest>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut engine = state.write().await;
+    let mode = req.and_then(|r| r.mode).unwrap_or_else(|| "worldstate_from_hypergraph".to_string());
+    if mode != "worldstate_from_hypergraph" {
+        return Ok(Json(serde_json::json!({
+            "status": "error",
+            "error": format!("Unsupported mode '{}'. Supported: worldstate_from_hypergraph", mode),
+        })));
+    }
+
+    if let Err(e) = engine.sync_worldstate_schema_from_hypergraph() {
+        eprintln!("Schema sync failed: {}", e);
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    let pack = engine.export_metadata_pack_execution_truth(None);
+    let tables: Vec<String> = pack.tables.iter().map(|t| t.name.clone()).collect();
+    let world_exec_schema_hash = engine.worldstate_execution_schema_hash(&tables);
+    let hyper_exec_schema_hash = engine.hypergraph_schema_hash(&tables);
+
+    Ok(Json(serde_json::json!({
+        "status": "success",
+        "mode": mode,
+        "tables": tables,
+        "worldstate_execution_schema_hash": world_exec_schema_hash,
+        "hypergraph_execution_schema_hash": hyper_exec_schema_hash,
+    })))
 }

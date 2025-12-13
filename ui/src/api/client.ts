@@ -48,6 +48,72 @@ export async function runQuery(sql: string): Promise<QueryResult> {
   }
 }
 
+export interface AskLLMRequest {
+  intent: string;
+  user_id?: string | null;
+  ollama_url?: string;
+  model?: string;
+}
+
+export interface AskLLMResponse {
+  status: 'success' | 'validation_failed' | 'execution_failed' | 'schema_out_of_sync';
+  entry_id?: string;
+  structured_plan?: any;
+  sql?: string;
+  result?: {
+    row_count: number;
+    execution_time_ms: number;
+  };
+  reason?: string;
+  suggestions?: string[];
+  error?: string;
+}
+
+export async function askLLM(request: AskLLMRequest): Promise<AskLLMResponse> {
+  try {
+    const response = await api.post<AskLLMResponse>('/ask', {
+      intent: request.intent,
+      user_id: request.user_id || null,
+      ollama_url: request.ollama_url || 'http://localhost:11434',
+      model: request.model || 'llama3.2', // Default to llama3.2
+    });
+    // If response has schema_out_of_sync status, return it as-is
+    if (response.data.status === 'schema_out_of_sync') {
+      return {
+        ...response.data,
+        reason: response.data.reason || 'Schema is out of sync',
+        suggestions: response.data.suggestions || [],
+      };
+    }
+    return response.data;
+  } catch (error: any) {
+    if (error.response) {
+      // Check if it's a schema_out_of_sync error
+      if (error.response.data?.status === 'schema_out_of_sync') {
+        return {
+          status: 'schema_out_of_sync',
+          reason: error.response.data?.reason || 'Schema is out of sync',
+          suggestions: error.response.data?.suggestions || [],
+        };
+      }
+      return {
+        status: 'execution_failed',
+        error: error.response.data?.error || error.response.data?.message || 'LLM query failed',
+      };
+    } else if (error.request) {
+      return {
+        status: 'execution_failed',
+        error: 'Network error: Could not connect to server',
+      };
+    } else {
+      return {
+        status: 'execution_failed',
+        error: error.message || 'Unknown error occurred',
+      };
+    }
+  }
+}
+
 export async function getSchema(): Promise<TableSchema[]> {
   try {
     const response = await api.get<{ tables: string[] }>('/tables');
@@ -107,3 +173,25 @@ export async function getHealth(): Promise<{ status: string }> {
   return response.data;
 }
 
+export interface ClearAllResponse {
+  success: boolean;
+  message: string;
+  tables_dropped: string[];
+  cleared_items: string[];
+  error?: string;
+}
+
+export async function clearAllData(): Promise<ClearAllResponse> {
+  try {
+    const response = await api.post<ClearAllResponse>('/clear_all');
+    return response.data;
+  } catch (error: any) {
+    return {
+      success: false,
+      message: error.response?.data?.message || error.message || 'Failed to clear all data',
+      tables_dropped: [],
+      cleared_items: [],
+      error: error.response?.data?.error || error.message,
+    };
+  }
+}

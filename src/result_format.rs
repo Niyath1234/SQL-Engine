@@ -118,11 +118,30 @@ pub fn format_results(
 pub fn batches_to_rows(result: &QueryResult, column_names: &[String]) -> Vec<Vec<String>> {
     let mut rows = Vec::new();
     
-    for batch in &result.batches {
-        let row_count = batch.row_count;
+    eprintln!("DEBUG batches_to_rows: Processing {} batches", result.batches.len());
+    
+    for (batch_idx, batch) in result.batches.iter().enumerate() {
+        // CRITICAL FIX: Iterate over the FULL selection bitmap length, not row_count
+        // row_count is the count of SELECTED rows, but we need to scan all rows
+        // and include only those where selection[row_idx] is true.
+        // The selection bitmap has the same length as the underlying arrays.
+        let total_rows = batch.selection.len();
         let col_count = column_names.len();
         
-        for row_idx in 0..row_count {
+        eprintln!("DEBUG batches_to_rows: Batch {} - selection.len()={}, row_count={}, selection.count_ones()={}", 
+            batch_idx, total_rows, batch.row_count, batch.selection.count_ones());
+        
+        // Debug: Show which bits are set
+        let set_bits: Vec<usize> = batch.selection.iter()
+            .enumerate()
+            .filter_map(|(i, b)| if *b { Some(i) } else { None })
+            .take(10)
+            .collect();
+        eprintln!("DEBUG batches_to_rows: First 10 set bits at positions: {:?}", set_bits);
+        
+        let mut batch_rows = 0;
+        for row_idx in 0..total_rows {
+            // Skip unselected rows
             if !batch.selection[row_idx] {
                 continue;
             }
@@ -137,9 +156,12 @@ pub fn batches_to_rows(result: &QueryResult, column_names: &[String]) -> Vec<Vec
                 }
             }
             rows.push(row);
+            batch_rows += 1;
         }
+        eprintln!("DEBUG batches_to_rows: Added {} rows from batch {}", batch_rows, batch_idx);
     }
     
+    eprintln!("DEBUG batches_to_rows: Total rows returned: {}", rows.len());
     rows
 }
 

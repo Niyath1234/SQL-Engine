@@ -1,10 +1,14 @@
 use crate::execution::operators::build_operator_with_llm_limits;
 use crate::execution::batch::{ExecutionBatch, BatchIterator};
 use crate::execution::exec_node::ExecNode;
+use crate::execution::panic_boundary;
 use crate::query::plan::{QueryPlan, PlanOperator};
 use crate::hypergraph::graph::HyperGraph;
+use crate::error::{EngineError, EngineResult};
+use crate::config::EngineConfig;
 use anyhow::Result;
 use std::sync::Arc;
+use tracing::{info, error, debug, warn, instrument};
 
 /// Execution engine - executes query plans
 pub struct ExecutionEngine {
@@ -17,58 +21,76 @@ pub struct ExecutionEngine {
     spill_manager: Option<std::sync::Arc<tokio::sync::Mutex<crate::spill::manager::SpillManager>>>,
     /// Persistent compiled operator cache (for WASM JIT)
     operator_cache: Option<std::sync::Arc<std::sync::Mutex<crate::cache::operator_cache::OperatorCache>>>,
+    /// Engine configuration
+    config: EngineConfig,
 }
 
 impl ExecutionEngine {
     pub fn new(graph: HyperGraph) -> Self {
-        // FEATURE 2: Use hardware-tuned batch size
+        Self::with_config(graph, EngineConfig::default())
+    }
+    
+    pub fn with_config(graph: HyperGraph, config: EngineConfig) -> Self {
+        // FEATURE 2: Use hardware-tuned batch size (can be overridden by config)
         use crate::execution::hardware_tuning::HardwareTuningProfile;
         let hardware_profile = HardwareTuningProfile::benchmark();
-        let batch_size = hardware_profile.batch_size;
+        let batch_size = config.batch_size.max(hardware_profile.batch_size);
         
         Self {
             graph: std::sync::Arc::new(graph),
-            batch_size, // Hardware-tuned batch size
+            batch_size,
             hardware_profile: Some(hardware_profile),
             spill_manager: None,
             operator_cache: None,
+            config,
         }
     }
     
     pub fn from_arc(graph: std::sync::Arc<HyperGraph>) -> Self {
-        // FEATURE 2: Use hardware-tuned batch size
+        Self::from_arc_with_config(graph, EngineConfig::default())
+    }
+    
+    pub fn from_arc_with_config(graph: std::sync::Arc<HyperGraph>, config: EngineConfig) -> Self {
+        // FEATURE 2: Use hardware-tuned batch size (can be overridden by config)
         use crate::execution::hardware_tuning::HardwareTuningProfile;
         let hardware_profile = HardwareTuningProfile::benchmark();
-        let batch_size = hardware_profile.batch_size;
+        let batch_size = config.batch_size.max(hardware_profile.batch_size);
         
         Self {
             graph,
-            batch_size, // Hardware-tuned batch size
+            batch_size,
             hardware_profile: Some(hardware_profile),
             spill_manager: None,
             operator_cache: None,
+            config,
         }
     }
     
     /// Create execution engine with spill manager enabled
     pub fn with_spill(graph: HyperGraph, threshold_bytes: usize) -> Self {
-        // FEATURE 2: Use hardware-tuned batch size
+        let config = EngineConfig::default();
+        Self::with_spill_and_config(graph, threshold_bytes, config)
+    }
+    
+    pub fn with_spill_and_config(graph: HyperGraph, threshold_bytes: usize, config: EngineConfig) -> Self {
+        // FEATURE 2: Use hardware-tuned batch size (can be overridden by config)
         use crate::execution::hardware_tuning::HardwareTuningProfile;
         let hardware_profile = HardwareTuningProfile::benchmark();
-        let batch_size = hardware_profile.batch_size;
+        let batch_size = config.batch_size.max(hardware_profile.batch_size);
         
         let spill_manager = crate::spill::manager::SpillManager::with_config(
             crate::spill::manager::SpillConfig {
                 threshold_bytes,
-                spill_dir: std::path::PathBuf::from(".spill"),
+                spill_dir: config.spill.spill_dir.clone(),
             }
         );
         Self {
             graph: std::sync::Arc::new(graph),
-            batch_size, // Hardware-tuned batch size
+            batch_size,
             hardware_profile: Some(hardware_profile),
             spill_manager: Some(std::sync::Arc::new(tokio::sync::Mutex::new(spill_manager))),
             operator_cache: None,
+            config,
         }
     }
     
@@ -77,17 +99,26 @@ impl ExecutionEngine {
         graph: std::sync::Arc<HyperGraph>,
         operator_cache: std::sync::Arc<std::sync::Mutex<crate::cache::operator_cache::OperatorCache>>,
     ) -> Self {
-        // FEATURE 2: Use hardware-tuned batch size
+        Self::with_operator_cache_and_config(graph, operator_cache, EngineConfig::default())
+    }
+    
+    pub fn with_operator_cache_and_config(
+        graph: std::sync::Arc<HyperGraph>,
+        operator_cache: std::sync::Arc<std::sync::Mutex<crate::cache::operator_cache::OperatorCache>>,
+        config: EngineConfig,
+    ) -> Self {
+        // FEATURE 2: Use hardware-tuned batch size (can be overridden by config)
         use crate::execution::hardware_tuning::HardwareTuningProfile;
         let hardware_profile = HardwareTuningProfile::benchmark();
-        let batch_size = hardware_profile.batch_size;
+        let batch_size = config.batch_size.max(hardware_profile.batch_size);
         
         Self {
             graph,
-            batch_size, // Hardware-tuned batch size
+            batch_size,
             hardware_profile: Some(hardware_profile),
             spill_manager: None,
             operator_cache: Some(operator_cache),
+            config,
         }
     }
     
@@ -131,19 +162,25 @@ impl ExecutionEngine {
         let start = std::time::Instant::now();
         
         // Build execution operator tree with LLM limits, CTE results, and subquery executor
-        eprintln!("DEBUG ExecutionEngine::execute_with_subquery_executor: cte_results.is_some()={}, cte_results.len()={:?}, subquery_executor.is_some()={}", 
-            cte_results.is_some(), 
-            cte_results.map(|r| r.len()).unwrap_or(0),
-            subquery_executor.is_some());
+        debug!(
+            cte_results_present = cte_results.is_some(),
+            cte_results_len = cte_results.map(|r| r.len()).unwrap_or(0),
+            subquery_executor_present = subquery_executor.is_some(),
+            "Building execution operator tree"
+        );
         if let Some(ref results) = cte_results {
-            eprintln!("DEBUG ExecutionEngine::execute_with_subquery_executor: cte_results keys: {:?}", results.keys().collect::<Vec<_>>());
+            debug!(cte_keys = ?results.keys().collect::<Vec<_>>(), "CTE results available");
         }
-        eprintln!("DEBUG ExecutionEngine::execute_with_subquery_executor: plan.root operator type: {:?}", 
-            std::mem::discriminant(&plan.root));
+        debug!(
+            operator_type = ?std::mem::discriminant(&plan.root),
+            "Plan root operator type"
+        );
         // CRITICAL DEBUG: Check if plan.root is Project and what its input is
         if let PlanOperator::Project { input, .. } = &plan.root {
-            eprintln!("DEBUG ExecutionEngine::execute_with_subquery_executor: plan.root is Project, input type: {:?}", 
-                std::mem::discriminant(input.as_ref()));
+            debug!(
+                input_type = ?std::mem::discriminant(input.as_ref()),
+                "Project operator input type"
+            );
         }
         let build_start = std::time::Instant::now();
         let mut root_op = crate::execution::operators::build_operator_with_subquery_executor(
@@ -163,21 +200,26 @@ impl ExecutionEngine {
         
         // PREPARE PHASE: Call prepare() on root operator ONCE before execution
         // This builds all hash tables, initializes data structures, and recursively prepares nested operators
-        eprintln!("[PREPARE] Preparing root operator (type: {:?})", std::any::type_name_of_val(&*root_op));
+        info!(
+            operator_type = std::any::type_name_of_val(&*root_op),
+            "Preparing root operator"
+        );
         
         // CRITICAL FIX: Use prepare_child helper which ensures correct type dispatch
         // Direct trait object dispatch may not work correctly, so we use the helper
         // that can handle type-specific downcasting if needed
-        match crate::execution::operators::FilterOperator::prepare_child(&mut root_op) {
+        // Wrap in panic boundary for safety
+        match panic_boundary::with_panic_boundary_result(|| {
+            crate::execution::operators::FilterOperator::prepare_child(&mut root_op)
+        }) {
             Ok(()) => {
-                eprintln!("[PREPARE] Root operator prepared successfully, starting execution");
+                info!("Root operator prepared successfully, starting execution");
             }
             Err(e) => {
-                eprintln!("[PREPARE] ERROR: Root operator prepare() failed: {}", e);
+                error!(error = %e, "Root operator prepare() failed or panicked");
                 return Err(anyhow::anyhow!("Failed to prepare root operator: {}", e));
             }
         }
-        eprintln!("[PREPARE] Root operator prepared, starting execution");
         
         // Execute pipeline with early termination optimization
         // TERMINATION CONTRACT: root_op.next() must eventually return None
@@ -186,39 +228,58 @@ impl ExecutionEngine {
         let mut batches = vec![];
         let mut total_rows = 0;
         let mut iteration_count = 0;
-        const MAX_ITERATIONS: usize = 10_000_000; // Safety limit (10M batches)
-        const MAX_EXECUTION_TIME_SECS: u64 = 60; // 1 minute timeout (reduced for faster failure detection)
+        let max_iterations = self.config.execution.max_iterations;
+        let max_execution_time_secs = self.config.execution.max_execution_time_secs;
         
         // CRITICAL: Check timeout before entering loop to catch hangs on first call
         loop {
-            // Check timeout before each iteration
-            if exec_start.elapsed().as_secs() > MAX_EXECUTION_TIME_SECS {
+            // Check timeout before each iteration (use config value)
+            if exec_start.elapsed().as_secs() > max_execution_time_secs {
+                warn!(
+                    elapsed_secs = exec_start.elapsed().as_secs(),
+                    max_secs = max_execution_time_secs,
+                    "Query execution timeout"
+                );
                 return Err(anyhow::anyhow!(
                     "ERR_QUERY_TIMEOUT: Query execution exceeded {} seconds. \
                     This may indicate a bug, pathological query, or very large dataset. \
                     Consider adding LIMIT or optimizing the query.",
-                    MAX_EXECUTION_TIME_SECS
+                    max_execution_time_secs
                 ));
             }
             
-            // Guard against infinite loops
-            if iteration_count > MAX_ITERATIONS {
+            // Guard against infinite loops (use config value)
+            if iteration_count > max_iterations {
+                warn!(
+                    iterations = iteration_count,
+                    max_iterations = max_iterations,
+                    "Query execution iteration limit exceeded"
+                );
                 return Err(anyhow::anyhow!(
                     "ERR_INFINITE_LOOP_DETECTED: Query execution exceeded {} iterations. \
                     This indicates an operator is not properly terminating. \
                     Possible causes: operator bug, infinite data source, or missing termination condition.",
-                    MAX_ITERATIONS
+                    max_iterations
                 ));
             }
             
-            match root_op.next()? {
+            // Wrap next() call in panic boundary
+            let batch_result = panic_boundary::with_panic_boundary_result(|| {
+                root_op.next()
+            });
+            
+            match batch_result? {
                 Some(batch) => {
                     iteration_count += 1;
                     // Check timeout (LLM protocol: max_time_ms)
                     if let Some(max_time) = max_time_ms {
                         let elapsed_ms = start.elapsed().as_millis() as u64;
                         if elapsed_ms >= max_time {
-                            eprintln!("ExecutionEngine: Timeout reached ({}ms >= {}ms), stopping execution", elapsed_ms, max_time);
+                            warn!(
+                                elapsed_ms = elapsed_ms,
+                                max_time_ms = max_time,
+                                "LLM protocol timeout reached, stopping execution"
+                            );
                             break;
                         }
                     }
@@ -269,8 +330,12 @@ impl ExecutionEngine {
             }
             
                     total_rows += batch.row_count;
-                    // Debug logging disabled to prevent memory issues in IDEs
-                    // eprintln!("ExecutionEngine: Got batch with {} rows (total so far: {})", batch.row_count, total_rows);
+                    debug!(
+                        batch_rows = batch.row_count,
+                        total_rows = total_rows,
+                        batch_count = batches.len() + 1,
+                        "Received batch"
+                    );
                     batches.push(batch);
                     
                     // Early termination: if we have a small result set and no more batches needed,
@@ -336,7 +401,7 @@ impl ExecutionEngine {
         // WILDCARD EXPANSION: Expand wildcards BEFORE planning and execution
         // This ensures CTE materialization uses fully expanded column lists
         expand_wildcards_in_parsed_query(&mut parsed, &self.graph)?;
-        eprintln!("DEBUG execute_subquery_ast: After wildcard expansion, columns: {:?}", parsed.columns);
+        debug!(columns = ?parsed.columns, "execute_subquery_ast: After wildcard expansion");
         
         // EDGE CASE 2 FIX: Set CTE context on planner so it can resolve CTE names
         // Create planner with CTE context if needed (planner is not Clone)
@@ -388,9 +453,9 @@ impl ExecutionEngine {
         )?;
         
         // ExecNode: Prepare phase - build all hash tables and initialize operators
-        eprintln!("[EXEC ENGINE] Calling prepare() on root operator (parallel path)");
+        debug!("[EXEC ENGINE] Calling prepare() on root operator (parallel path)");
         crate::execution::operators::FilterOperator::prepare_child(&mut root_op)?;
-        eprintln!("[EXEC ENGINE] Prepare phase complete, starting parallel execution");
+        debug!("[EXEC ENGINE] Prepare phase complete, starting parallel execution");
         
         // For parallel execution, we collect batches in parallel where possible
         // The main parallelization happens at the fragment level in ScanOperator
@@ -408,7 +473,11 @@ impl ExecutionEngine {
             if let Some(max_time) = max_time_ms {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 if elapsed_ms >= max_time {
-                    eprintln!("ExecutionEngine: Timeout reached ({}ms >= {}ms), stopping execution", elapsed_ms, max_time);
+                    warn!(
+                        elapsed_ms = elapsed_ms,
+                        max_time_ms = max_time,
+                        "ExecutionEngine: Timeout reached, stopping execution"
+                    );
                     break;
                 }
             }

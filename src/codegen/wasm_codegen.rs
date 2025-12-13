@@ -88,7 +88,7 @@ impl WasmCodegen {
         // 3. Handle type conversions
         // 4. Optimize the generated code
         
-        let wasm_source = format!(
+        let _wasm_source = format!(
             r#"(module
   (memory (export "memory") 1)
   (func (export "run") (param $ptr i32) (param $len i32) (result i32)
